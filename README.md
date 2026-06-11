@@ -38,6 +38,14 @@ python rag_cli.py search "怎么创建虚拟环境" --rerank
 
 # 5. 跑问答测试集，量化检索命中率（hit@k / MRR）；加 --rerank 可对比重排前后的指标
 python rag_cli.py eval eval_questions.jsonl
+
+# 6. 管理笔记：增 / 改 / 删之后都会自动增量更新索引，改完立刻能搜到
+python rag_cli.py note add "读书笔记-原子习惯" "核心观点：习惯是复利……"
+python rag_cli.py note append "读书笔记-原子习惯" "第二章：身份认同比目标更重要。"
+python rag_cli.py note open "读书笔记-原子习惯"     # 用默认编辑器打开做大段修改（改完手动 index）
+python rag_cli.py note list
+python rag_cli.py note delete "读书笔记-原子习惯"
+# 默认操作 sample_notes 文件夹，加 --folder <路径> 可指向自己的笔记库
 ```
 
 把 `sample_notes` 换成你自己的笔记文件夹（支持 `.md` / `.txt` / `.pdf`，递归扫描）。
@@ -52,6 +60,7 @@ python rag_cli.py eval eval_questions.jsonl
 | `retrieve` | 混合检索：向量与 BM25 两路排名，RRF 融合取 top-k；可选 cross-encoder 重排 |
 | `cmd_ask` | 片段注入 prompt，流式调用 Claude（云端）或 Ollama（本地）回答 |
 | `cmd_eval` | 跑 JSONL 问答测试集，输出 hit@1 / hit@k / MRR 检索指标 |
+| `cmd_note_*` | 笔记增/改/删/列表/打开，改动后调用 `do_index` 自动增量更新索引 |
 
 ## 升级进度（阶段 1 清单）
 
@@ -61,6 +70,7 @@ python rag_cli.py eval eval_questions.jsonl
 - [x] **PDF 接入**：`index` 支持 `.pdf`（pypdf 逐页抽取文本）
 - [x] **本地模型**：`ask --backend ollama` 走本地 Ollama（默认 `qwen3:4b`），完全离线；`--backend claude`（默认）走云端
 - [x] **rerank**：`--rerank` 用 cross-encoder（`bge-reranker-base`）对召回的前 20 个候选重排
-- [x] **评测工具**：`eval` 命令跑 JSONL 测试集，输出 hit@1 / hit@k / MRR；`eval_questions.jsonl` 是 10 条示例
+- [x] **评测工具**：`eval` 命令跑 JSONL 测试集，输出 hit@1 / hit@k / MRR
+- [x] **问答测试集**：50 条问答（`eval_questions.jsonl`，基于 11 篇模拟笔记），混合检索基线 hit@1 94% / MRR 0.970（阶段 1 收尾条件达成；换成真实笔记后照同样格式重建即可）
+- [x] **笔记管理**：`note add / append / delete / list / open`，增删改后自动增量更新索引
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB
-- [ ] **问答测试集**：用自己的真实笔记构建 50-100 条评测集，量化检索命中率（阶段 1 收尾条件；工具已就绪，需要真实笔记+真实问题）

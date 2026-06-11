@@ -141,7 +141,11 @@ def read_document(f: Path) -> str:
 
 
 def cmd_index(args):
-    folder = Path(args.folder)
+    do_index(Path(args.folder), rebuild=args.rebuild)
+
+
+def do_index(folder: Path, rebuild: bool = False):
+    """对文件夹建索引（默认增量）。note 命令改动笔记后也直接调用它。"""
     if not folder.is_dir():
         sys.exit(f"错误：{folder} 不是文件夹")
 
@@ -156,7 +160,7 @@ def cmd_index(args):
     old_embeddings = None
     old_hashes: dict[str, str] = {}
     files_json = INDEX_DIR / "files.json"
-    if not args.rebuild and files_json.exists():
+    if not rebuild and files_json.exists():
         try:
             old_chunks, old_embeddings = load_index()
             old_hashes = json.loads(files_json.read_text(encoding="utf-8"))
@@ -423,6 +427,67 @@ def cmd_ask(args):
     print()
 
 
+# ---------- 笔记管理：增 / 改 / 删，每次操作后自动增量重建索引 ----------
+
+def note_file(folder: Path, title: str) -> Path:
+    """标题即文件名：<folder>/<标题>.md。标题里不能带 Windows 文件名禁用字符。"""
+    if re.search(r'[\\/:*?"<>|]', title):
+        sys.exit('错误：标题不能包含 \\ / : * ? " < > | 这些字符')
+    return folder / f"{title}.md"
+
+
+def cmd_note_add(args):
+    folder = Path(args.folder)
+    folder.mkdir(exist_ok=True)
+    f = note_file(folder, args.title)
+    if f.exists():
+        sys.exit(f"错误：{f} 已存在。用 note append 追加内容，或先 note delete 删除")
+    body = f"\n{args.content}\n" if args.content else "\n"
+    f.write_text(f"# {args.title}\n{body}", encoding="utf-8")
+    print(f"已创建 {f}")
+    do_index(folder)
+
+
+def cmd_note_append(args):
+    f = note_file(Path(args.folder), args.title)
+    if not f.exists():
+        sys.exit(f"错误：找不到 {f}（用 note list 查看现有笔记）")
+    with f.open("a", encoding="utf-8") as fp:
+        fp.write(f"\n{args.content}\n")
+    print(f"已追加到 {f}")
+    do_index(Path(args.folder))
+
+
+def cmd_note_delete(args):
+    f = note_file(Path(args.folder), args.title)
+    if not f.exists():
+        sys.exit(f"错误：找不到 {f}（用 note list 查看现有笔记）")
+    f.unlink()
+    print(f"已删除 {f}")
+    do_index(Path(args.folder))
+
+
+def cmd_note_list(args):
+    folder = Path(args.folder)
+    files = sorted(folder.glob("*.md")) if folder.is_dir() else []
+    if not files:
+        sys.exit(f"{folder} 下还没有笔记（用 note add <标题> <内容> 创建）")
+    for f in files:
+        first = f.read_text(encoding="utf-8", errors="ignore").lstrip().splitlines()
+        print(f"{f.stem:<20} {f.stat().st_size:>6} 字节  {first[0] if first else '(空)'}")
+
+
+def cmd_note_open(args):
+    """用系统默认编辑器打开笔记，自由修改大段内容。改完记得 index 一下。"""
+    import os
+
+    f = note_file(Path(args.folder), args.title)
+    if not f.exists():
+        sys.exit(f"错误：找不到 {f}（用 note list 查看现有笔记）")
+    os.startfile(f)  # Windows：交给默认关联程序打开
+    print(f"已打开 {f}。编辑保存后运行 python rag_cli.py index {args.folder} 更新索引")
+
+
 def cmd_eval(args):
     """跑问答测试集，量化检索质量。
 
@@ -497,6 +562,25 @@ def main():
     )
     p_ask.add_argument("--model", default=None, help="模型名，不填则按后端用默认值")
     p_ask.set_defaults(func=cmd_ask)
+
+    # note 命令下再分一层子命令（add/append/delete/list/open），结构同 git remote add
+    p_note = sub.add_parser("note", help="管理笔记：增/改/删后自动更新索引")
+    note_sub = p_note.add_subparsers(dest="action", required=True)
+    for name, func, help_text, with_content in [
+        ("add", cmd_note_add, "新建一篇笔记", True),
+        ("append", cmd_note_append, "往已有笔记追加一段内容", True),
+        ("delete", cmd_note_delete, "删除一篇笔记", False),
+        ("open", cmd_note_open, "用默认编辑器打开笔记做大段修改", False),
+    ]:
+        p = note_sub.add_parser(name, help=help_text)
+        p.add_argument("title", help="笔记标题（即文件名，不含 .md）")
+        if with_content:
+            p.add_argument("content", nargs="?", default="", help="笔记内容")
+        p.add_argument("--folder", default="sample_notes", help="笔记文件夹（默认 sample_notes）")
+        p.set_defaults(func=func)
+    p_list = note_sub.add_parser("list", help="列出所有笔记")
+    p_list.add_argument("--folder", default="sample_notes")
+    p_list.set_defaults(func=cmd_note_list)
 
     p_eval = sub.add_parser("eval", help="跑问答测试集，输出 hit@k / MRR 检索指标")
     p_eval.add_argument("testset", help="JSONL 测试集，每行含 question / expect_source / 可选 expect_text")
