@@ -12,6 +12,7 @@ rag_cli.py —— 阶段 0：最朴素的本地笔记 RAG 问答工具
 """
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -54,6 +55,11 @@ def chunk_text(text: str, max_chars: int = 500, overlap: int = 100) -> list[str]
     return chunks
 
 
+def file_hash(path: Path) -> str:
+    """文件内容的 SHA-256 指纹——增量索引判断'文件是否变过'的依据。"""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def cmd_index(args):
     folder = Path(args.folder)
     if not folder.is_dir():
@@ -63,26 +69,75 @@ def cmd_index(args):
     if not files:
         sys.exit(f"错误：{folder} 下没有找到 .md / .txt 文件")
 
-    chunks: list[dict] = []
-    for f in files:
-        text = f.read_text(encoding="utf-8", errors="ignore")
-        for i, c in enumerate(chunk_text(text)):
-            chunks.append({"source": str(f), "chunk_id": i, "text": c})
-    print(f"共 {len(files)} 个文件，切分出 {len(chunks)} 个文本块")
+    # 增量索引：读旧索引作为复用基础；--rebuild 强制从零重建
+    old_chunks: list[dict] = []
+    old_embeddings = None
+    old_hashes: dict[str, str] = {}
+    files_json = INDEX_DIR / "files.json"
+    if not args.rebuild and files_json.exists():
+        try:
+            old_chunks, old_embeddings = load_index()
+            old_hashes = json.loads(files_json.read_text(encoding="utf-8"))
+        except Exception:
+            print("旧索引损坏或不完整，改为全量重建", file=sys.stderr)
+            old_chunks, old_embeddings, old_hashes = [], None, {}
 
-    embedder = load_embedder()
-    embeddings = embedder.encode(
-        [c["text"] for c in chunks],
-        normalize_embeddings=True,  # 归一化后，余弦相似度 = 点积
-        show_progress_bar=True,
-    )
+    # 旧块按来源文件分组，未变化的文件可以整体复用
+    old_by_source: dict[str, list[int]] = {}
+    for i, c in enumerate(old_chunks):
+        old_by_source.setdefault(c["source"], []).append(i)
+
+    new_hashes: dict[str, str] = {}
+    kept_chunks: list[dict] = []   # 复用的旧块
+    kept_rows: list[int] = []      # 它们在旧 embeddings 里的行号
+    fresh_chunks: list[dict] = []  # 需要重新向量化的新块
+    n_unchanged = n_changed = 0
+
+    for f in files:
+        key = str(f)
+        h = file_hash(f)
+        new_hashes[key] = h
+        if old_hashes.get(key) == h and key in old_by_source:
+            n_unchanged += 1
+            for i in old_by_source[key]:
+                kept_chunks.append(old_chunks[i])
+                kept_rows.append(i)
+        else:
+            n_changed += 1
+            text = f.read_text(encoding="utf-8", errors="ignore")
+            for ci, c in enumerate(chunk_text(text)):
+                fresh_chunks.append({"source": key, "chunk_id": ci, "text": c})
+
+    n_deleted = len(set(old_hashes) - set(new_hashes))
+    print(f"文件：{n_unchanged} 个未变（复用向量），{n_changed} 个新增/修改（重新计算），{n_deleted} 个已删除")
+
+    parts = []
+    if kept_rows:
+        parts.append(old_embeddings[kept_rows])
+    if fresh_chunks:
+        embedder = load_embedder()  # 全部复用时连模型都不用加载
+        parts.append(
+            embedder.encode(
+                [c["text"] for c in fresh_chunks],
+                normalize_embeddings=True,  # 归一化后，余弦相似度 = 点积
+                show_progress_bar=True,
+            ).astype(np.float32)
+        )
+    if not parts:
+        sys.exit("没有可索引的内容")
+
+    chunks = kept_chunks + fresh_chunks
+    embeddings = np.vstack(parts)
 
     INDEX_DIR.mkdir(exist_ok=True)
     (INDEX_DIR / "chunks.json").write_text(
         json.dumps(chunks, ensure_ascii=False, indent=1), encoding="utf-8"
     )
-    np.save(INDEX_DIR / "embeddings.npy", embeddings.astype(np.float32))
-    print(f"索引已保存到 {INDEX_DIR.resolve()}")
+    np.save(INDEX_DIR / "embeddings.npy", embeddings)
+    files_json.write_text(
+        json.dumps(new_hashes, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+    print(f"索引共 {len(chunks)} 块，已保存到 {INDEX_DIR.resolve()}")
 
 
 def load_index():
@@ -143,8 +198,9 @@ def main():
     parser = argparse.ArgumentParser(description="本地笔记 RAG 问答工具（阶段 0）")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_index = sub.add_parser("index", help="对笔记文件夹建立向量索引")
+    p_index = sub.add_parser("index", help="对笔记文件夹建立向量索引（默认增量）")
     p_index.add_argument("folder", help="包含 .md / .txt 笔记的文件夹")
+    p_index.add_argument("--rebuild", action="store_true", help="忽略旧索引，全量重建")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="检索最相关的笔记片段")

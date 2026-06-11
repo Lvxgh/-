@@ -19,6 +19,8 @@ python -m pip install -r requirements.txt
 
 ```powershell
 # 1. 对笔记文件夹建索引（生成 .rag_index/ 目录）
+#    默认增量：只重算新增/修改过的文件，没变的直接复用旧向量
+#    加 --rebuild 可强制全量重建
 python rag_cli.py index sample_notes
 
 # 2. 纯检索：看看哪些片段和问题最相关（不需要 API key）
@@ -41,9 +43,10 @@ python rag_cli.py ask "这个项目分几个阶段？"
 | `cmd_search` | 打印检索结果，用于直观感受检索质量 |
 | `cmd_ask` | 把检索到的片段塞进 prompt，流式调用 Claude 回答 |
 
-## 刻意保持简单的地方（也是阶段 1 的升级方向）
+## 升级进度（阶段 1 清单）
 
-- **暴力检索**：直接 numpy 点积，没有向量数据库 → 阶段 1 换 sqlite-vec / LanceDB
-- **只有向量检索**：没有 BM25 关键词检索和 rerank → 阶段 1 做混合检索
-- **全量重建索引**：每次 index 都重算所有 embedding → 阶段 1 做增量索引
-- **固定切块**：不感知 Markdown 标题结构 → 阶段 1 按标题层级切块
+- [x] **增量索引**：按文件内容 SHA-256 判断变化，未变文件整体复用旧向量（`.rag_index/files.json` 记录指纹）
+- [ ] **混合检索**：补上 BM25 关键词检索和 rerank，目前只有向量检索
+- [ ] **结构感知切块**：按 Markdown 标题层级切块，目前是固定 500 字滑窗
+- [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB
+- [ ] **本地模型**：接入 Ollama，做到完全离线可用

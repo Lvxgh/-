@@ -15,3 +15,7 @@
 ## argparse
 
 命令行工具用 argparse 标准库。add_subparsers 可以实现 git 那样的子命令结构，每个子命令可以有自己的参数。
+
+## f-string
+
+Python 3.6+ 用 f-string 做字符串插值：f"hello {name}"，比 format 简洁。
