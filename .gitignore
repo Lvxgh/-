@@ -1,0 +1,5 @@
+# 机器本地产物，换机器后重建
+.venv/
+.rag_index/
+__pycache__/
+*.pyc
