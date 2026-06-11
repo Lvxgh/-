@@ -561,29 +561,82 @@ def cmd_memory_list(args):
     print(f"共 {len(memories)} 条记忆")
 
 
-def cmd_memory_recall(args):
-    """最小版记忆召回：向量相似度 + 重要性加权。
+def recall_memories(query: str, top_k: int) -> list[dict]:
+    """记忆召回核心：向量相似度 + 重要性加权。recall 命令和 memory eval 共用，
+    保证评测的就是线上真实在跑的那套逻辑。
 
     总分 = 余弦相似度 + 0.03 × importance。
     0.03 的直觉：重要性从 1 到 5 最多抬 0.12 分——相似度接近时让重要记忆胜出，
     但不至于让无关的高重要性记忆挤掉真正相关的。时间衰减、类型权重等留到后面，
-    加任何新打分因子前先在测试集上验证不回退。
+    加任何新打分因子前先跑 memory eval 验证不回退。
     """
     memories, embeddings = load_memories()
     if not memories:
         sys.exit("记忆库是空的，没有可召回的内容")
     embedder = load_embedder()
-    q = embedder.encode([QUERY_PREFIX + args.query], normalize_embeddings=True)[0]
+    q = embedder.encode([QUERY_PREFIX + query], normalize_embeddings=True)[0]
     sims = embeddings @ q
     importance = np.array([m["importance"] for m in memories], dtype=np.float32)
     finals = sims + 0.03 * importance
-    for rank, i in enumerate(np.argsort(finals)[::-1][: args.top_k], 1):
-        m = memories[int(i)]
+    return [
+        {**memories[int(i)], "final": float(finals[i]), "sim": float(sims[i])}
+        for i in np.argsort(finals)[::-1][:top_k]
+    ]
+
+
+def cmd_memory_recall(args):
+    for rank, m in enumerate(recall_memories(args.query, args.top_k), 1):
         print(
-            f"[{rank}] 总分 {finals[i]:.3f}（相似 {sims[i]:.3f} + 重要性 {m['importance']}×0.03）"
+            f"[{rank}] 总分 {m['final']:.3f}（相似 {m['sim']:.3f} + 重要性 {m['importance']}×0.03）"
             f"  {m['type']}  {m['id']}"
         )
         print(f"    {m['content']}")
+
+
+def memory_hit(mem: dict, case: dict) -> bool:
+    """一条召回结果是否命中评测样本。
+
+    优先按内容关键词判断（expected_contains 中任一出现即命中）——内容比 id 稳定；
+    样本没给关键词时才退回按类型判断（只看 type 容易过宽，所以是兜底而非首选）。
+    """
+    contains = case.get("expected_contains")
+    if contains:
+        return any(kw in mem["content"] for kw in contains)
+    return mem["type"] == case.get("expected_type")
+
+
+def cmd_memory_eval(args):
+    """跑记忆召回评测集，输出 hit@1/3/5 和 MRR。
+
+    和 RAG 的 cmd_eval 同一套方法论：改打分策略前后各跑一遍，指标不许倒退。
+    """
+    path = Path(args.dataset)
+    if not path.exists():
+        sys.exit(f"错误：找不到评测集 {path}")
+    cases = json.loads(path.read_text(encoding="utf-8"))
+    if not cases:
+        sys.exit(f"错误：{path} 是空的")
+
+    hit1 = hit3 = hit5 = 0
+    mrr = 0.0
+    for n, case in enumerate(cases, 1):
+        hits = recall_memories(case["query"], 5)
+        rank = next((r for r, m in enumerate(hits, 1) if memory_hit(m, case)), 0)
+        if rank:
+            mrr += 1 / rank
+            hit1 += rank == 1
+            hit3 += rank <= 3
+            hit5 += 1
+        mark = f"命中 rank={rank}" if rank else "未命中 ✗　"
+        print(f"[{n:>2}] {mark}  {case['query']}")
+
+    n = len(cases)
+    print("-" * 60)
+    print(f"记忆评测：{path}，共 {n} 题")
+    print(
+        f"hit@1 {hit1 / n:.1%} | hit@3 {hit3 / n:.1%}"
+        f" | hit@5 {hit5 / n:.1%} | MRR {mrr / n:.3f}"
+    )
 
 
 def cmd_memory_forget(args):
@@ -713,6 +766,10 @@ def main():
     p_mforget = mem_sub.add_parser("forget", help="按 id 删除一条记忆")
     p_mforget.add_argument("memory_id", help="记忆 id，如 m3（memory list 可查）")
     p_mforget.set_defaults(func=cmd_memory_forget)
+    p_meval = mem_sub.add_parser("eval", help="跑记忆召回评测集，输出 hit@1/3/5 / MRR")
+    p_meval.add_argument("--dataset", default="eval/memory_eval.json",
+                         help="评测集路径（默认 eval/memory_eval.json）")
+    p_meval.set_defaults(func=cmd_memory_eval)
 
     p_eval = sub.add_parser("eval", help="跑问答测试集，输出 hit@k / MRR 检索指标")
     p_eval.add_argument("testset", help="JSONL 测试集，每行含 question / expect_source / 可选 expect_text")
