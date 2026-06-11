@@ -86,4 +86,5 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 - [x] **笔记管理**：`note add / append / delete / list / open`，增删改后自动增量更新索引
 - [x] **记忆系统最小闭环（阶段 2 第一步）**：`memory add / list / recall / forget`，三类记忆（preference/semantic/episodic）
 - [x] **记忆评测 + 混合召回（阶段 2 第二步）**：`memory eval`（12 题，hit@1/3/5 + MRR）；召回升级为向量+BM25 RRF 混合后 hit@1 66.7%→75%、MRR 0.736→0.847
+- [x] **记忆去重（阶段 2 第三步）**：`memory add` 自动查重，与已有记忆相似度 ≥0.92 时拒绝并提示，`--force` 可跳过
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB

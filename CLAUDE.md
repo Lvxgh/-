@@ -42,7 +42,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - [x] 最小闭环：`memory add/list/recall/forget`，三类记忆 + 重要性加权召回（`.memory_store/`，行号对齐同 RAG 索引）
 - [ ] 记忆提取：从对话/文档自动提取结构化记忆，分 episodic（事件）/ semantic（事实）/ preference（偏好）三类
-- [ ] 记忆生命周期：合并去重、冲突解决（新旧信息矛盾时如何更新）、时间衰减与遗忘策略
+- [x] 去重（最小版）：add 时与全库算余弦相似度，≥0.92（`DUP_THRESHOLD`）拒绝入库并提示已有记忆，`--force` 可跳过
+- [ ] 记忆生命周期（其余）：相似记忆合并、冲突解决（新旧信息矛盾时如何更新）、时间衰减与遗忘策略
 - [x] 记忆评测：`memory eval`（hit@1/3/5 + MRR，`eval/memory_eval.json` 12 题），改打分策略前后必跑、不许回退
 - [x] 记忆召回升级为混合检索：向量 + BM25 RRF 融合 + 0.0001×重要性微调（评测从 hit@1 66.7%/MRR 0.736 → 75%/0.847）
 - [ ] 记忆检索继续升级：时间衰减、关联度（动手前先扩评测集，12 题太少容易过拟合）

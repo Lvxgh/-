@@ -500,6 +500,9 @@ def cmd_note_open(args):
 
 MEMORY_DIR = Path(".memory_store")
 MEMORY_TYPES = ["preference", "semantic", "episodic"]
+# add 时的查重阈值：新记忆与已有记忆余弦相似度达到该值即视为重复。
+# bge-small 上近似改写一般 0.9+，主题相关但内容不同一般 0.5-0.8
+DUP_THRESHOLD = 0.92
 
 
 def load_memories() -> tuple[list[dict], "np.ndarray | None"]:
@@ -542,6 +545,20 @@ def cmd_memory_add(args):
     embedder = load_embedder()
     # 记忆内容是"文档"一侧，按 bge 约定不加查询前缀
     emb = embedder.encode([args.content], normalize_embeddings=True).astype(np.float32)
+
+    # 查重：和已有记忆几乎一样的内容不再入库，避免记忆库被重复污染
+    if embeddings is not None and not args.force:
+        sims = embeddings @ emb[0]
+        nearest = int(np.argmax(sims))
+        if sims[nearest] >= DUP_THRESHOLD:
+            old = memories[nearest]
+            sys.exit(
+                f"未添加：与已有记忆 [{old['id']}] 相似度 {sims[nearest]:.3f}（阈值 {DUP_THRESHOLD}）\n"
+                f"  已有：{old['content']}\n"
+                f"  新增：{args.content}\n"
+                f"确认不是重复就加 --force 强制添加；想更新旧记忆请先 memory forget {old['id']}"
+            )
+
     memories.append(mem)
     embeddings = emb if embeddings is None else np.vstack([embeddings, emb])
     save_memories(memories, embeddings)
@@ -776,6 +793,7 @@ def main():
     p_madd.add_argument("--importance", type=int, choices=range(1, 6), default=3,
                         help="重要性 1-5（默认 3），召回时加权")
     p_madd.add_argument("--tags", default="", help="逗号分隔的标签，如 学习,项目")
+    p_madd.add_argument("--force", action="store_true", help="跳过查重，强制添加")
     p_madd.set_defaults(func=cmd_memory_add)
     p_mlist = mem_sub.add_parser("list", help="列出所有记忆")
     p_mlist.set_defaults(func=cmd_memory_list)
