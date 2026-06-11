@@ -29,9 +29,11 @@ python rag_cli.py ask "<问题>"               # 检索+生成，需要 $env:ANT
 
 单文件 `rag_cli.py`（~190 行）实现完整 RAG 管线：
 
-`chunk_text`（按段落切 ~500 字块）→ `cmd_index`（bge 向量化，存 `.rag_index/chunks.json` + `embeddings.npy` + `files.json` 文件指纹）→ `retrieve`（暴力余弦相似度 top-k）→ `cmd_ask`（片段注入 prompt，流式调用 Claude，默认 `claude-opus-4-8`）。
+`chunk_markdown`（`.md` 按标题层级切小节，块前缀「【标题路径】」；`.txt` 走 `chunk_text` 固定切块；超长小节由 `chunk_text` 滑窗细分）→ `cmd_index`（bge 向量化，存 `.rag_index/chunks.json` + `embeddings.npy` + `files.json` 文件指纹）→ `retrieve`（暴力余弦相似度 top-k）→ `cmd_ask`（片段注入 prompt，流式调用 Claude，默认 `claude-opus-4-8`）。
 
 索引是**增量**的：`files.json` 存每个文件内容的 SHA-256，未变文件整体复用旧 embeddings 行（全复用时不加载模型）；`--rebuild` 强制全量。chunks 和 embeddings 按行号一一对应，任何改动必须保持这个对齐。
+
+**改动切块逻辑或 embedding 模型后必须 `--rebuild`**——文件指纹不变，增量模式会继续复用按旧逻辑算出的块。
 
 关键约定：
 

@@ -14,6 +14,7 @@ rag_cli.py —— 阶段 0：最朴素的本地笔记 RAG 问答工具
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -32,6 +33,53 @@ def load_embedder():
 
     print(f"加载 embedding 模型 {EMBED_MODEL}（首次运行会自动下载）...", file=sys.stderr)
     return SentenceTransformer(EMBED_MODEL)
+
+
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)")
+
+
+def split_markdown_sections(text: str) -> list[tuple[str, str]]:
+    """按标题把 Markdown 切成小节，返回 (标题路径, 正文) 列表。
+
+    标题路径形如 "Python 学习笔记 > 虚拟环境"，用标题栈维护层级：
+    遇到 N 级标题就弹掉栈里所有 >= N 级的标题再入栈。
+    """
+    sections: list[tuple[str, str]] = []
+    stack: list[tuple[int, str]] = []  # (标题级别, 标题文字)
+    cur_lines: list[str] = []
+
+    def flush():
+        body = "\n".join(cur_lines).strip()
+        if body:
+            path = " > ".join(title for _, title in stack)
+            sections.append((path, body))
+
+    for line in text.splitlines():
+        m = HEADING_RE.match(line)
+        if m:
+            flush()
+            cur_lines = []
+            level = len(m.group(1))
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, m.group(2).strip()))
+        else:
+            cur_lines.append(line)
+    flush()
+    return sections
+
+
+def chunk_markdown(text: str) -> list[str]:
+    """结构感知切块：每个小节独立成块，块文本带上标题路径作为上下文。
+
+    标题路径既帮 embedding 理解"这段在讲什么主题下的内容"，
+    也让检索结果和送给 Claude 的片段自带出处层级。超长小节再滑窗细分。
+    """
+    chunks: list[str] = []
+    for path, body in split_markdown_sections(text):
+        for piece in chunk_text(body):
+            chunks.append(f"【{path}】\n{piece}" if path else piece)
+    return chunks
 
 
 def chunk_text(text: str, max_chars: int = 500, overlap: int = 100) -> list[str]:
@@ -105,7 +153,8 @@ def cmd_index(args):
         else:
             n_changed += 1
             text = f.read_text(encoding="utf-8", errors="ignore")
-            for ci, c in enumerate(chunk_text(text)):
+            chunker = chunk_markdown if f.suffix == ".md" else chunk_text
+            for ci, c in enumerate(chunker(text)):
                 fresh_chunks.append({"source": key, "chunk_id": ci, "text": c})
 
     n_deleted = len(set(old_hashes) - set(new_hashes))
