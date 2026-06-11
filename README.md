@@ -43,9 +43,12 @@ python rag_cli.py eval eval_questions.jsonl
 python rag_cli.py memory add "用户喜欢先结论、短答。" --type preference --importance 5
 python rag_cli.py memory add "2026-06 完成阶段1评测。" --type episodic --importance 4
 python rag_cli.py memory recall "用户喜欢怎样的回答风格？" -k 3   # 混合检索 + 重要性微调
+python rag_cli.py memory recall "怎么防止重复？" --rerank          # cross-encoder 重排，更准但更慢
 python rag_cli.py memory list
 python rag_cli.py memory forget m2
-python rag_cli.py memory eval        # 跑记忆召回评测集（eval/memory_eval.json）
+python rag_cli.py memory eval        # 跑记忆召回评测集；--rerank 对比重排效果
+python rag_cli.py memory extract 聊天记录.md --dry-run   # LLM 自动提取记忆（预览）；需 API key 或 Ollama
+# ask 会自动注入 top3 相关记忆，让回答贴合你的偏好和背景（--no-memory 关闭）
 # 记忆存在 .memory_store/（个人数据，不进 Git）。评测前先按 eval/memory_eval.json
 # 的预期内容添加 demo 记忆（见仓库提交历史或 CLAUDE.md）
 
@@ -87,6 +90,7 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 - [x] **记忆系统最小闭环（阶段 2 第一步）**：`memory add / list / recall / forget`，三类记忆（preference/semantic/episodic）
 - [x] **记忆评测 + 混合召回（阶段 2 第二步）**：`memory eval`（hit@1/3/5 + MRR）；召回升级为向量+BM25 RRF 混合（12 题旧集 hit@1 66.7%→75%）
 - [x] **评测集扩厚（阶段 2 第四步）**：37 题 × 29 条记忆，同义/间接问法防刷分，失败样本输出 top5 详情
-- [x] **召回超参实验（阶段 2 第五步）**：网格实验选定 RRF K=20；当前基线 hit@1 59.5% / hit@3 81.1% / hit@5 89.2% / MRR 0.699；cross-encoder rerank 占位接口已挂入管线
+- [x] **召回超参实验（阶段 2 第五步）**：网格实验选定 RRF K=20；混合检索基线 hit@1 59.5% / hit@3 81.1% / hit@5 89.2% / MRR 0.699
+- [x] **记忆 rerank + 提取 + ask 闭环（阶段 2 第六步）**：`--rerank` 真 cross-encoder（hit@1 59.5%→**75.7%**、MRR 0.830）；`memory extract` LLM 自动提取（source=extracted，待 LLM 后端验证）；`ask` 自动注入 top3 记忆
 - [x] **记忆去重（阶段 2 第三步）**：`memory add` 自动查重，与已有记忆相似度 ≥0.92 时拒绝并提示，`--force` 可跳过
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB

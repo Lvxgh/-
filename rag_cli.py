@@ -415,15 +415,32 @@ def cmd_ask(args):
         f"<片段 来源=\"{h['source']}\">\n{h['text']}\n</片段>" for h in hits
     )
 
+    # 注入个人记忆：回答不仅基于笔记，还贴合用户的偏好和背景（阶段 2 的记忆闭环）
+    mems: list[dict] = []
+    if not args.no_memory and (MEMORY_DIR / "memories.json").exists():
+        memories, _ = load_memories()
+        if memories:
+            mems = recall_memories(args.question, 3)
+    memory_block = (
+        "\n\n<关于用户的记忆>\n"
+        + "\n".join(f"- [{m['type']}] {m['content']}" for m in mems)
+        + "\n</关于用户的记忆>"
+    ) if mems else ""
+
     system = (
         "你是用户的个人笔记问答助手。请只根据 <笔记内容> 中提供的片段回答问题，"
         "并指出答案来自哪个文件。如果笔记中没有相关信息，就直说没有找到，不要编造。"
+        + (
+            "<关于用户的记忆> 是用户本人的背景和偏好，用来调整回答的角度和风格，"
+            "不要把它当作笔记内容来引用。" if mems else ""
+        )
     )
-    user_msg = f"<笔记内容>\n{context}\n</笔记内容>\n\n问题：{args.question}"
+    user_msg = f"<笔记内容>\n{context}\n</笔记内容>{memory_block}\n\n问题：{args.question}"
 
     # --model 未指定时按后端选默认值
     model = args.model or (DEFAULT_MODEL if args.backend == "claude" else DEFAULT_OLLAMA_MODEL)
-    print(f"\n[检索到 {len(hits)} 个相关片段，{args.backend}/{model} 生成回答...]\n", file=sys.stderr)
+    mem_note = f"，注入 {len(mems)} 条记忆" if mems else ""
+    print(f"\n[检索到 {len(hits)} 个相关片段{mem_note}，{args.backend}/{model} 生成回答...]\n", file=sys.stderr)
     if args.backend == "claude":
         ask_claude(model, system, user_msg)
     else:
@@ -526,7 +543,14 @@ def save_memories(memories: list[dict], embeddings):
         (MEMORY_DIR / "embeddings.npy").unlink(missing_ok=True)
 
 
-def cmd_memory_add(args):
+def add_memory(content: str, mtype: str = "semantic", importance: int = 3,
+               tags: list[str] | None = None, source: str = "manual",
+               force: bool = False):
+    """添加一条记忆的底层实现（memory add 和 memory extract 共用）。
+
+    成功返回 (True, 新记忆)；被查重拦截返回 (False, (相似度, 已有记忆))。
+    每次调用整库读写——个人记忆量级（几百条）下简单优先，不做批量优化。
+    """
     memories, embeddings = load_memories()
     # id 取现存最大编号 +1。注意：删掉最大号后再 add 会复用该编号——
     # 旧记忆已不存在所以无碍；将来若要 id 永不复用，需把计数器持久化
@@ -534,35 +558,43 @@ def cmd_memory_add(args):
     now = datetime.now().isoformat(timespec="seconds")
     mem = {
         "id": f"m{next_n}",
-        "content": args.content,
-        "type": args.type,
-        "importance": args.importance,
+        "content": content,
+        "type": mtype,
+        "importance": importance,
         "created_at": now,
         "updated_at": now,
-        "source": "manual",  # 阶段 2 后期会有 "extracted"（从对话自动提取）
-        "tags": [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else [],
+        "source": source,  # manual=手动添加，extracted=LLM 自动提取
+        "tags": tags or [],
     }
     embedder = load_embedder()
     # 记忆内容是"文档"一侧，按 bge 约定不加查询前缀
-    emb = embedder.encode([args.content], normalize_embeddings=True).astype(np.float32)
+    emb = embedder.encode([content], normalize_embeddings=True).astype(np.float32)
 
     # 查重：和已有记忆几乎一样的内容不再入库，避免记忆库被重复污染
-    if embeddings is not None and not args.force:
+    if embeddings is not None and not force:
         sims = embeddings @ emb[0]
         nearest = int(np.argmax(sims))
         if sims[nearest] >= DUP_THRESHOLD:
-            old = memories[nearest]
-            sys.exit(
-                f"未添加：与已有记忆 [{old['id']}] 相似度 {sims[nearest]:.3f}（阈值 {DUP_THRESHOLD}）\n"
-                f"  已有：{old['content']}\n"
-                f"  新增：{args.content}\n"
-                f"确认不是重复就加 --force 强制添加；想更新旧记忆请先 memory forget {old['id']}"
-            )
+            return False, (float(sims[nearest]), memories[nearest])
 
     memories.append(mem)
     embeddings = emb if embeddings is None else np.vstack([embeddings, emb])
     save_memories(memories, embeddings)
-    print(f"已记住 [{mem['id']}]（{mem['type']}，重要性 {mem['importance']}）：{mem['content']}")
+    return True, mem
+
+
+def cmd_memory_add(args):
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
+    ok, info = add_memory(args.content, args.type, args.importance, tags=tags, force=args.force)
+    if not ok:
+        sim, old = info
+        sys.exit(
+            f"未添加：与已有记忆 [{old['id']}] 相似度 {sim:.3f}（阈值 {DUP_THRESHOLD}）\n"
+            f"  已有：{old['content']}\n"
+            f"  新增：{args.content}\n"
+            f"确认不是重复就加 --force 强制添加；想更新旧记忆请先 memory forget {old['id']}"
+        )
+    print(f"已记住 [{info['id']}]（{info['type']}，重要性 {info['importance']}）：{info['content']}")
 
 
 def cmd_memory_list(args):
@@ -571,11 +603,123 @@ def cmd_memory_list(args):
         sys.exit('记忆库是空的。用 memory add "内容" --type semantic 添加一条')
     for m in memories:
         tags = f"  #{','.join(m['tags'])}" if m["tags"] else ""
+        src = "  ←extracted" if m.get("source") == "extracted" else ""
         print(
             f"[{m['id']:>4}] {m['type']:<10} 重要性 {m['importance']}"
-            f"  {m['created_at'][:10]}  {m['content']}{tags}"
+            f"  {m['created_at'][:10]}  {m['content']}{tags}{src}"
         )
     print(f"共 {len(memories)} 条记忆")
+
+
+# ---------- LLM 自动记忆提取：从对话/文档抽取结构化记忆（source=extracted） ----------
+
+EXTRACT_PROMPT = (
+    "你是一个记忆提取器。从用户提供的文本中提取值得长期记住的信息，"
+    "分三类：preference（用户偏好）、semantic（长期事实）、episodic（带时间的事件经历）。\n"
+    "要求：\n"
+    "- 每条记忆独立完整，单独拿出来也能看懂；以第三人称陈述（如「用户……」）\n"
+    "- 只提取有长期价值的信息，寒暄和过程性细节不要\n"
+    '- importance 取 1-5：5=核心身份或原则，3=一般信息，1=琐事\n'
+    '- 每行输出一个 JSON 对象：{"content": "...", "type": "semantic", "importance": 3}\n'
+    "- 除 JSON 行外不要输出任何其他文字；最多提取 {max_n} 条"
+)
+
+
+def llm_complete(backend: str, model: str, system: str, user_msg: str) -> str:
+    """非流式调一次 LLM，拿完整回复（提取等内部用途；ask 的流式输出走 ask_claude/ask_ollama）。"""
+    if backend == "claude":
+        import anthropic
+
+        client = anthropic.Anthropic()  # 从环境变量 ANTHROPIC_API_KEY 读取密钥
+        resp = client.messages.create(
+            model=model, max_tokens=4000, system=system,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        return "".join(b.text for b in resp.content if b.type == "text")
+
+    import urllib.error
+    import urllib.request
+
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user_msg}],
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request("http://localhost:11434/api/chat", data=payload,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())["message"]["content"]
+    except urllib.error.URLError:
+        sys.exit(
+            "错误：连不上 Ollama（http://localhost:11434）。\n"
+            "请先安装并启动 Ollama（https://ollama.com），"
+            f"然后执行 ollama pull {model} 下载模型。"
+        )
+
+
+def parse_extracted_memories(text: str) -> list[dict]:
+    """解析 LLM 输出的记忆列表：每行一个 JSON 对象。
+
+    对模型的小毛病保持宽容：跳过 ```json 围栏和夹杂的说明文字、容忍行尾逗号；
+    type 不合法归为 semantic，importance 越界夹到 1-5。解析失败的行直接丢弃。
+    """
+    out: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip().strip("`").strip().rstrip(",")
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        content = str(obj.get("content", "")).strip()
+        if not content:
+            continue
+        mtype = obj.get("type") if obj.get("type") in MEMORY_TYPES else "semantic"
+        try:
+            importance = max(1, min(5, int(obj.get("importance", 3))))
+        except (TypeError, ValueError):
+            importance = 3
+        out.append({"content": content, "type": mtype, "importance": importance})
+    return out
+
+
+def cmd_memory_extract(args):
+    if args.text:
+        text = args.text
+    elif args.source_file:
+        f = Path(args.source_file)
+        if not f.exists():
+            sys.exit(f"错误：找不到文件 {f}")
+        text = read_document(f)
+    else:
+        sys.exit("错误：请给出要提取的文件路径，或用 --text 直接给一段文本")
+
+    model = args.model or (DEFAULT_MODEL if args.backend == "claude" else DEFAULT_OLLAMA_MODEL)
+    print(f"[{args.backend}/{model} 提取记忆中...]", file=sys.stderr)
+    # 注意不能用 .format()——提示词里的 JSON 示例带大括号，会被当成占位符
+    reply = llm_complete(args.backend, model, EXTRACT_PROMPT.replace("{max_n}", str(args.max_n)), text)
+    extracted = parse_extracted_memories(reply)[: args.max_n]
+    if not extracted:
+        sys.exit("没有提取到任何记忆（模型输出格式不对，或文本里没有可提取的内容）")
+
+    n_added = n_dup = 0
+    for em in extracted:
+        if args.dry_run:
+            print(f"[预览]（{em['type']}，重要性 {em['importance']}）{em['content']}")
+            continue
+        ok, info = add_memory(em["content"], em["type"], em["importance"], source="extracted")
+        if ok:
+            n_added += 1
+            print(f"已记住 [{info['id']}]（{em['type']}，重要性 {em['importance']}，extracted）：{em['content']}")
+        else:
+            n_dup += 1
+            sim, old = info
+            print(f"跳过重复（与 [{old['id']}] 相似度 {sim:.3f}）：{em['content']}")
+    if not args.dry_run:
+        print(f"提取完成：新增 {n_added} 条，跳过重复 {n_dup} 条")
 
 
 # 重要性加分系数。RRF 里相邻名次的分差约 0.00026，取 0.0001 让重要性只在
@@ -590,19 +734,24 @@ MEMORY_RRF_K = 20
 
 
 def rerank_with_cross_encoder(query: str, candidates: list[dict]) -> list[dict]:
-    """记忆重排的占位接口：将来接 cross-encoder（如 bge-reranker-base，模型已在本地）。
+    """cross-encoder 重排：查询和每条候选记忆拼成一对，逐对过模型打分后重新排序。
 
-    37 题评测里 5 个失败全是"查询与记忆零词面交集"型，正是 cross-encoder 的强项。
-    调用方传进来的是约 3 倍于 top_k 的候选池（重排的"翻盘空间"），本函数负责
-    重新排序，调用方再裁回 top_k。当前版本不加载模型、原序返回。
+    向量检索是 bi-encoder——查询、记忆各自独立编码，模型看不到两者的交互；
+    cross-encoder 能逐词比对两边，对"查询与记忆零词面交集"的间接问法最有效
+    （37 题评测里 5 个失败全是这种类型，调参实验已证明超参救不了它们）。
+    复用 RAG 检索同一个 bge-reranker-base，调用方传入约 3 倍候选池、重排后裁回。
     """
-    # TODO: 复用 load_reranker() 对 (query, content) 逐对打分，按分数降序返回
-    return candidates
+    reranker = load_reranker()
+    scores = reranker.predict([(query, m["content"]) for m in candidates])
+    for m, s in zip(candidates, scores):
+        m["rerank"] = float(s)
+    return sorted(candidates, key=lambda m: m["rerank"], reverse=True)
 
 
-def recall_memories(query: str, top_k: int) -> list[dict]:
+def recall_memories(query: str, top_k: int, rerank: bool = False) -> list[dict]:
     """记忆召回核心：混合检索（向量 + BM25，RRF 融合）+ 重要性微调。
     recall 命令和 memory eval 共用，保证评测的就是线上真实在跑的那套逻辑。
+    rerank=True 时再过一遍 cross-encoder（更准但更慢，需加载约 1.1GB 模型）。
 
     和笔记检索的 retrieve() 同一套思路，直接复用 BM25 类和 tokenize。
     改这里的任何打分逻辑，前后都要跑 memory eval 对比，指标不许回退。
@@ -625,9 +774,8 @@ def recall_memories(query: str, top_k: int) -> list[dict]:
 
     importance = np.array([m["importance"] for m in memories], dtype=np.float32)
     finals = rrf + IMPORTANCE_COEF * importance
-    # 给重排留"翻盘空间"：取约 3 倍候选进入 rerank，再裁回 top_k。
-    # 占位版 rerank 保持原序，所以当前行为与直接取 top_k 完全一致。
-    pool = max(top_k * 3, 15)
+    # rerank 时多取约 3 倍候选，给 cross-encoder 留"翻盘空间"，重排后再裁回 top_k
+    pool = max(top_k * 3, 15) if rerank else top_k
     hits = [
         {
             **memories[int(i)],
@@ -637,13 +785,16 @@ def recall_memories(query: str, top_k: int) -> list[dict]:
         }
         for i in np.argsort(finals)[::-1][:pool]
     ]
-    return rerank_with_cross_encoder(query, hits)[:top_k]
+    if rerank:
+        hits = rerank_with_cross_encoder(query, hits)[:top_k]
+    return hits
 
 
 def cmd_memory_recall(args):
-    for rank, m in enumerate(recall_memories(args.query, args.top_k), 1):
+    for rank, m in enumerate(recall_memories(args.query, args.top_k, rerank=args.rerank), 1):
+        rr = f"rerank {m['rerank']:.3f} | " if "rerank" in m else ""
         print(
-            f"[{rank}] 总分 {m['final']:.4f}（向量 {m['sim']:.3f} | BM25 {m['bm25']:.2f}"
+            f"[{rank}] {rr}RRF {m['final']:.4f}（向量 {m['sim']:.3f} | BM25 {m['bm25']:.2f}"
             f" | 重要性 {m['importance']}）  {m['type']}  {m['id']}"
         )
         print(f"    {m['content']}")
@@ -676,7 +827,7 @@ def cmd_memory_eval(args):
     hit1 = hit3 = hit5 = 0
     mrr = 0.0
     for n, case in enumerate(cases, 1):
-        hits = recall_memories(case["query"], 5)
+        hits = recall_memories(case["query"], 5, rerank=args.rerank)
         rank = next((r for r, m in enumerate(hits, 1) if memory_hit(m, case)), 0)
         if rank:
             mrr += 1 / rank
@@ -696,6 +847,7 @@ def cmd_memory_eval(args):
     print(
         f"hit@1 {hit1 / n:.1%} | hit@3 {hit3 / n:.1%}"
         f" | hit@5 {hit5 / n:.1%} | MRR {mrr / n:.3f}"
+        + ("（已开启 rerank）" if args.rerank else "")
     )
 
 
@@ -783,6 +935,7 @@ def main():
         help="claude=云端 API（默认）；ollama=本地模型，完全离线",
     )
     p_ask.add_argument("--model", default=None, help="模型名，不填则按后端用默认值")
+    p_ask.add_argument("--no-memory", action="store_true", help="不注入个人记忆，只用笔记回答")
     p_ask.set_defaults(func=cmd_ask)
 
     # note 命令下再分一层子命令（add/append/delete/list/open），结构同 git remote add
@@ -823,6 +976,7 @@ def main():
     p_mrecall = mem_sub.add_parser("recall", help="按问题召回最相关的记忆")
     p_mrecall.add_argument("query", help="要回忆什么")
     p_mrecall.add_argument("-k", "--top-k", type=int, default=5)
+    p_mrecall.add_argument("--rerank", action="store_true", help="cross-encoder 重排（更准但更慢）")
     p_mrecall.set_defaults(func=cmd_memory_recall)
     p_mforget = mem_sub.add_parser("forget", help="按 id 删除一条记忆")
     p_mforget.add_argument("memory_id", help="记忆 id，如 m3（memory list 可查）")
@@ -830,7 +984,17 @@ def main():
     p_meval = mem_sub.add_parser("eval", help="跑记忆召回评测集，输出 hit@1/3/5 / MRR")
     p_meval.add_argument("--dataset", default="eval/memory_eval.json",
                          help="评测集路径（默认 eval/memory_eval.json）")
+    p_meval.add_argument("--rerank", action="store_true", help="开启重排后评测，便于对比")
     p_meval.set_defaults(func=cmd_memory_eval)
+    p_mext = mem_sub.add_parser("extract", help="用 LLM 从文件/文本自动提取记忆（source=extracted）")
+    p_mext.add_argument("source_file", nargs="?", default=None, help="要提取的文件（.md/.txt/.pdf）")
+    p_mext.add_argument("--text", default=None, help="直接给一段文本（与文件二选一）")
+    p_mext.add_argument("--backend", choices=["claude", "ollama"], default="claude",
+                        help="claude=云端 API（默认）；ollama=本地模型")
+    p_mext.add_argument("--model", default=None, help="模型名，不填按后端用默认值")
+    p_mext.add_argument("--max-n", type=int, default=10, dest="max_n", help="最多提取几条（默认 10）")
+    p_mext.add_argument("--dry-run", action="store_true", help="只预览提取结果，不入库")
+    p_mext.set_defaults(func=cmd_memory_extract)
 
     p_eval = sub.add_parser("eval", help="跑问答测试集，输出 hit@k / MRR 检索指标")
     p_eval.add_argument("testset", help="JSONL 测试集，每行含 question / expect_source / 可选 expect_text")
