@@ -3,19 +3,23 @@
 rag_cli.py —— 阶段 0：最朴素的本地笔记 RAG 问答工具
 
 三个命令：
-    python rag_cli.py index  <笔记文件夹>     # 建立索引（切块 + 向量化，存到 .rag_index/）
-    python rag_cli.py search <问题>           # 只检索：打印最相关的笔记片段
-    python rag_cli.py ask    <问题>           # 检索 + 调用 Claude 生成回答（需要 ANTHROPIC_API_KEY）
+    python rag_cli.py index  <笔记文件夹>     # 建索引（默认增量；支持 .md/.txt/.pdf）
+    python rag_cli.py search <问题>           # 混合检索：向量 + BM25，RRF 融合
+    python rag_cli.py ask    <问题>           # 检索 + 生成回答
+                                              #   --backend claude（默认，需 ANTHROPIC_API_KEY）
+                                              #   --backend ollama（本地模型，完全离线）
 
-设计刻意保持朴素：embedding 直接存 numpy 数组，检索用暴力余弦相似度。
+存储刻意保持朴素：embedding 直接存 numpy 数组，向量检索是暴力点积。
 个人笔记的量级（几千个片段）下这完全够用，也最利于理解 RAG 的每一步。
 """
 
 import argparse
 import hashlib
 import json
+import math
 import re
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +29,7 @@ EMBED_MODEL = "BAAI/bge-small-zh-v1.5"  # 中文优先的小型 embedding 模型
 # bge 系列模型要求：查询（短问题）加这个前缀，文档不加，检索效果才好
 QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 DEFAULT_MODEL = "claude-opus-4-8"
+DEFAULT_OLLAMA_MODEL = "qwen3:4b"
 
 
 def load_embedder():
@@ -108,14 +113,25 @@ def file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def read_document(f: Path) -> str:
+    """读取一个文档的纯文本。PDF 逐页抽取，其余按 UTF-8 文本读。"""
+    if f.suffix == ".pdf":
+        from pypdf import PdfReader
+
+        return "\n\n".join(page.extract_text() or "" for page in PdfReader(f).pages)
+    return f.read_text(encoding="utf-8", errors="ignore")
+
+
 def cmd_index(args):
     folder = Path(args.folder)
     if not folder.is_dir():
         sys.exit(f"错误：{folder} 不是文件夹")
 
-    files = sorted(list(folder.rglob("*.md")) + list(folder.rglob("*.txt")))
+    files = sorted(
+        list(folder.rglob("*.md")) + list(folder.rglob("*.txt")) + list(folder.rglob("*.pdf"))
+    )
     if not files:
-        sys.exit(f"错误：{folder} 下没有找到 .md / .txt 文件")
+        sys.exit(f"错误：{folder} 下没有找到 .md / .txt / .pdf 文件")
 
     # 增量索引：读旧索引作为复用基础；--rebuild 强制从零重建
     old_chunks: list[dict] = []
@@ -152,7 +168,7 @@ def cmd_index(args):
                 kept_rows.append(i)
         else:
             n_changed += 1
-            text = f.read_text(encoding="utf-8", errors="ignore")
+            text = read_document(f)
             chunker = chunk_markdown if f.suffix == ".md" else chunk_text
             for ci, c in enumerate(chunker(text)):
                 fresh_chunks.append({"source": key, "chunk_id": ci, "text": c})
@@ -199,26 +215,159 @@ def load_index():
     return chunks, embeddings
 
 
+TOKEN_RE = re.compile(r"[a-z0-9_]+|[一-鿿]+")
+
+
+def tokenize(text: str) -> list[str]:
+    """轻量中英文分词：英文按单词，中文按 单字 + 相邻双字（bigram）。
+
+    不用 jieba 等分词库——双字滑窗对 BM25 来说已经够用，且零依赖。
+    例："创建虚拟环境" -> [创, 建, 虚, 拟, 环, 境, 创建, 建虚, 虚拟, 拟环, 环境]
+    """
+    tokens: list[str] = []
+    for w in TOKEN_RE.findall(text.lower()):
+        if re.match(r"[一-鿿]", w):
+            tokens.extend(w)
+            tokens.extend(w[i : i + 2] for i in range(len(w) - 1))
+        else:
+            tokens.append(w)
+    return tokens
+
+
+class BM25:
+    """教科书版 BM25（Okapi）。打分 = Σ idf(词) * 饱和化的词频。
+
+    直觉：罕见词权重高（idf），词频带来的收益递减（k1 饱和），
+    长文档做长度惩罚（b）。个人笔记量级下每次查询现建索引即可，无需持久化。
+    """
+
+    def __init__(self, docs_tokens: list[list[str]], k1: float = 1.5, b: float = 0.75):
+        self.k1, self.b = k1, b
+        self.doc_tf = [Counter(d) for d in docs_tokens]
+        self.doc_len = np.array([len(d) for d in docs_tokens], dtype=np.float32)
+        self.avgdl = float(self.doc_len.mean()) if len(docs_tokens) else 1.0
+        df = Counter()
+        for d in docs_tokens:
+            df.update(set(d))
+        n = len(docs_tokens)
+        self.idf = {t: math.log(1 + (n - c + 0.5) / (c + 0.5)) for t, c in df.items()}
+
+    def scores(self, query_tokens: list[str]) -> np.ndarray:
+        out = np.zeros(len(self.doc_tf), dtype=np.float32)
+        for t in query_tokens:
+            idf = self.idf.get(t)
+            if idf is None:
+                continue
+            for i, tf_counter in enumerate(self.doc_tf):
+                tf = tf_counter.get(t, 0)
+                if tf:
+                    norm = self.k1 * (1 - self.b + self.b * self.doc_len[i] / self.avgdl)
+                    out[i] += idf * tf * (self.k1 + 1) / (tf + norm)
+        return out
+
+
 def retrieve(query: str, top_k: int) -> list[dict]:
+    """混合检索：向量（语义）+ BM25（关键词）两路，RRF 融合排名。
+
+    RRF（Reciprocal Rank Fusion）：每路只贡献 1/(60+名次)，
+    不直接加分数——这样就不用纠结余弦相似度和 BM25 分数量纲不同的问题。
+    """
     chunks, embeddings = load_index()
+
+    # 通道 1：向量语义检索
     embedder = load_embedder()
     q_emb = embedder.encode([QUERY_PREFIX + query], normalize_embeddings=True)[0]
-    scores = embeddings @ q_emb  # 归一化向量的点积 = 余弦相似度
-    top_idx = np.argsort(scores)[::-1][:top_k]
-    return [{**chunks[i], "score": float(scores[i])} for i in top_idx]
+    vec_scores = embeddings @ q_emb  # 归一化向量的点积 = 余弦相似度
+    vec_rank = np.argsort(vec_scores)[::-1]
+
+    # 通道 2：BM25 关键词检索
+    bm25 = BM25([tokenize(c["text"]) for c in chunks])
+    bm_scores = bm25.scores(tokenize(query))
+    bm_rank = np.argsort(bm_scores)[::-1]
+
+    # RRF 融合（每路取前 50）
+    K = 60
+    rrf: dict[int, float] = defaultdict(float)
+    for r, i in enumerate(vec_rank[:50]):
+        rrf[int(i)] += 1 / (K + r + 1)
+    for r, i in enumerate(bm_rank[:50]):
+        if bm_scores[i] <= 0:  # 关键词完全不匹配的不参与
+            break
+        rrf[int(i)] += 1 / (K + r + 1)
+
+    top = sorted(rrf, key=lambda i: rrf[i], reverse=True)[:top_k]
+    return [
+        {
+            **chunks[i],
+            "score": rrf[i],
+            "vec": float(vec_scores[i]),
+            "bm25": float(bm_scores[i]),
+        }
+        for i in top
+    ]
 
 
 def cmd_search(args):
     hits = retrieve(args.query, args.top_k)
     for rank, h in enumerate(hits, 1):
-        print(f"\n[{rank}] 相似度 {h['score']:.3f}  来源: {h['source']} #{h['chunk_id']}")
+        print(
+            f"\n[{rank}] RRF {h['score']:.4f}（向量 {h['vec']:.3f} | BM25 {h['bm25']:.2f}）"
+            f"  来源: {h['source']} #{h['chunk_id']}"
+        )
         print("-" * 60)
         print(h["text"])
 
 
-def cmd_ask(args):
+def ask_claude(model: str, system: str, user_msg: str):
     import anthropic
 
+    client = anthropic.Anthropic()  # 从环境变量 ANTHROPIC_API_KEY 读取密钥
+    with client.messages.stream(
+        model=model,
+        max_tokens=16000,
+        system=system,
+        messages=[{"role": "user", "content": user_msg}],
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+
+
+def ask_ollama(model: str, system: str, user_msg: str):
+    """走本地 Ollama 的流式聊天接口（http://localhost:11434），完全离线。"""
+    import urllib.error
+    import urllib.request
+
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            "stream": True,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "http://localhost:11434/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            for line in resp:  # Ollama 流式返回：每行一个 JSON
+                data = json.loads(line)
+                print(data.get("message", {}).get("content", ""), end="", flush=True)
+                if data.get("done"):
+                    break
+    except urllib.error.URLError:
+        sys.exit(
+            "错误：连不上 Ollama（http://localhost:11434）。\n"
+            "请先安装并启动 Ollama（https://ollama.com），"
+            f"然后执行 ollama pull {model} 下载模型。"
+        )
+
+
+def cmd_ask(args):
     hits = retrieve(args.question, args.top_k)
     context = "\n\n".join(
         f"<片段 来源=\"{h['source']}\">\n{h['text']}\n</片段>" for h in hits
@@ -230,16 +379,13 @@ def cmd_ask(args):
     )
     user_msg = f"<笔记内容>\n{context}\n</笔记内容>\n\n问题：{args.question}"
 
-    client = anthropic.Anthropic()  # 从环境变量 ANTHROPIC_API_KEY 读取密钥
-    print(f"\n[检索到 {len(hits)} 个相关片段，正在生成回答...]\n", file=sys.stderr)
-    with client.messages.stream(
-        model=args.model,
-        max_tokens=16000,
-        system=system,
-        messages=[{"role": "user", "content": user_msg}],
-    ) as stream:
-        for text in stream.text_stream:
-            print(text, end="", flush=True)
+    # --model 未指定时按后端选默认值
+    model = args.model or (DEFAULT_MODEL if args.backend == "claude" else DEFAULT_OLLAMA_MODEL)
+    print(f"\n[检索到 {len(hits)} 个相关片段，{args.backend}/{model} 生成回答...]\n", file=sys.stderr)
+    if args.backend == "claude":
+        ask_claude(model, system, user_msg)
+    else:
+        ask_ollama(model, system, user_msg)
     print()
 
 
@@ -257,10 +403,14 @@ def main():
     p_search.add_argument("-k", "--top-k", type=int, default=5)
     p_search.set_defaults(func=cmd_search)
 
-    p_ask = sub.add_parser("ask", help="检索并让 Claude 基于笔记回答")
+    p_ask = sub.add_parser("ask", help="检索并基于笔记生成回答")
     p_ask.add_argument("question", help="要问的问题")
     p_ask.add_argument("-k", "--top-k", type=int, default=5)
-    p_ask.add_argument("--model", default=DEFAULT_MODEL)
+    p_ask.add_argument(
+        "--backend", choices=["claude", "ollama"], default="claude",
+        help="claude=云端 API（默认）；ollama=本地模型，完全离线",
+    )
+    p_ask.add_argument("--model", default=None, help="模型名，不填则按后端用默认值")
     p_ask.set_defaults(func=cmd_ask)
 
     args = parser.parse_args()

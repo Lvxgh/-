@@ -23,30 +23,36 @@ python -m pip install -r requirements.txt
 #    加 --rebuild 可强制全量重建
 python rag_cli.py index sample_notes
 
-# 2. 纯检索：看看哪些片段和问题最相关（不需要 API key）
+# 2. 纯检索：混合检索（向量+BM25），不需要 API key
 python rag_cli.py search "怎么创建虚拟环境"
 
-# 3. 检索 + 让 Claude 基于笔记回答（需要先设置 API key）
+# 3a. 检索 + 让 Claude 基于笔记回答（需要先设置 API key）
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
 python rag_cli.py ask "这个项目分几个阶段？"
+
+# 3b. 或者走本地 Ollama，完全离线（需要先安装 https://ollama.com 并 pull 模型）
+python rag_cli.py ask "这个项目分几个阶段？" --backend ollama
 ```
 
-把 `sample_notes` 换成你自己的笔记文件夹（支持 `.md` 和 `.txt`，递归扫描）。
+把 `sample_notes` 换成你自己的笔记文件夹（支持 `.md` / `.txt` / `.pdf`，递归扫描）。
 
 ## 代码结构（读懂这 5 个函数就理解了 RAG）
 
 | 函数 | 作用 |
 |---|---|
-| `chunk_text` | 把长文档按段落切成 ~500 字的块 |
-| `cmd_index` | 所有块向量化后存盘（numpy 数组 + JSON） |
-| `retrieve` | 问题向量化，和所有块算余弦相似度，取 top-k |
-| `cmd_search` | 打印检索结果，用于直观感受检索质量 |
-| `cmd_ask` | 把检索到的片段塞进 prompt，流式调用 Claude 回答 |
+| `chunk_markdown` / `chunk_text` | Markdown 按标题层级切小节（带标题路径）；纯文本按段落切 ~500 字块 |
+| `cmd_index` | 增量索引：新增/修改的块向量化后存盘，未变文件复用旧向量 |
+| `tokenize` / `BM25` | 中英文轻量分词 + 手写教科书版 BM25 |
+| `retrieve` | 混合检索：向量与 BM25 两路排名，RRF 融合取 top-k |
+| `cmd_ask` | 片段注入 prompt，流式调用 Claude（云端）或 Ollama（本地）回答 |
 
 ## 升级进度（阶段 1 清单）
 
 - [x] **增量索引**：按文件内容 SHA-256 判断变化，未变文件整体复用旧向量（`.rag_index/files.json` 记录指纹）
 - [x] **结构感知切块**：`.md` 文件按标题层级切小节，块文本带「标题路径」上下文（如 `【Python 学习笔记 > 虚拟环境】`）。注意：改了切块逻辑后文件指纹不变，要手动 `--rebuild`
-- [ ] **混合检索**：补上 BM25 关键词检索和 rerank，目前只有向量检索
+- [x] **混合检索**：向量（语义）+ 手写 BM25（关键词，中文用单字+双字分词）两路，RRF 倒数排名融合；`search` 会显示每路的分数
+- [x] **PDF 接入**：`index` 支持 `.pdf`（pypdf 逐页抽取文本）
+- [x] **本地模型**：`ask --backend ollama` 走本地 Ollama（默认 `qwen3:4b`），完全离线；`--backend claude`（默认）走云端
+- [ ] **rerank**：用 cross-encoder 对候选重排，进一步提升精度
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB
-- [ ] **本地模型**：接入 Ollama，做到完全离线可用
+- [ ] **问答测试集**：用自己的真实笔记构建 50-100 条评测集，量化检索命中率（阶段 1 收尾条件）

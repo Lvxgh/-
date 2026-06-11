@@ -1,3 +1,4 @@
 anthropic
 sentence-transformers
 numpy
+pypdf
