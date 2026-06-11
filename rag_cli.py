@@ -593,9 +593,10 @@ def rerank_with_cross_encoder(query: str, candidates: list[dict]) -> list[dict]:
     """记忆重排的占位接口：将来接 cross-encoder（如 bge-reranker-base，模型已在本地）。
 
     37 题评测里 5 个失败全是"查询与记忆零词面交集"型，正是 cross-encoder 的强项。
-    当前版本不加载模型、原序返回，先把调用点固定在召回管线里。
+    调用方传进来的是约 3 倍于 top_k 的候选池（重排的"翻盘空间"），本函数负责
+    重新排序，调用方再裁回 top_k。当前版本不加载模型、原序返回。
     """
-    # TODO: 复用 load_reranker() 对 (query, content) 逐对打分后重排
+    # TODO: 复用 load_reranker() 对 (query, content) 逐对打分，按分数降序返回
     return candidates
 
 
@@ -624,6 +625,9 @@ def recall_memories(query: str, top_k: int) -> list[dict]:
 
     importance = np.array([m["importance"] for m in memories], dtype=np.float32)
     finals = rrf + IMPORTANCE_COEF * importance
+    # 给重排留"翻盘空间"：取约 3 倍候选进入 rerank，再裁回 top_k。
+    # 占位版 rerank 保持原序，所以当前行为与直接取 top_k 完全一致。
+    pool = max(top_k * 3, 15)
     hits = [
         {
             **memories[int(i)],
@@ -631,9 +635,9 @@ def recall_memories(query: str, top_k: int) -> list[dict]:
             "sim": float(sims[i]),
             "bm25": float(bm[i]),
         }
-        for i in np.argsort(finals)[::-1][:top_k]
+        for i in np.argsort(finals)[::-1][:pool]
     ]
-    return rerank_with_cross_encoder(query, hits)
+    return rerank_with_cross_encoder(query, hits)[:top_k]
 
 
 def cmd_memory_recall(args):

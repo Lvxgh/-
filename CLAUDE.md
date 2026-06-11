@@ -107,7 +107,7 @@ python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget
 
 记忆系统（阶段 2，`cmd_memory_*`）：记忆存 `.memory_store/memories.json` + `embeddings.npy`，行号一一对应（同 RAG 索引约定，forget 时用 `np.delete` 同步删行）。每条记忆含 id（m1、m2…取最大号+1）/ content / type（preference/semantic/episodic）/ importance（1-5）/ created_at / updated_at / source（manual，将来有 extracted）/ tags。`.memory_store/` 是个人数据，已加入 .gitignore。
 
-记忆召回（`recall_memories`，recall 命令与 memory eval 共用）：混合检索——向量余弦 + BM25（复用 RAG 的 BM25 类和 tokenize）RRF 融合（`MEMORY_RRF_K=20`，独立于 RAG 的 K=60），再加 `IMPORTANCE_COEF=0.0001 × importance` 微调。两个超参都经过 37 题评测网格实验（K∈{20,60,100}×系数∈{0,0.0001,0.0003}）选定。召回结果最后过 `rerank_with_cross_encoder()` 占位接口（当前原序返回，将来接 bge-reranker）。记忆内容是文档侧不加 bge 前缀，查询加。**改打分逻辑前后必须跑 `memory eval` 对比，指标不许回退**。
+记忆召回（`recall_memories`，recall 命令与 memory eval 共用）：混合检索——向量余弦 + BM25（复用 RAG 的 BM25 类和 tokenize）RRF 融合（`MEMORY_RRF_K=20`，独立于 RAG 的 K=60），再加 `IMPORTANCE_COEF=0.0001 × importance` 微调。两个超参都经过 37 题评测网格实验（K∈{20,60,100}×系数∈{0,0.0001,0.0003}）选定。召回末端先取约 3 倍候选池（`pool = max(top_k*3, 15)`）过 `rerank_with_cross_encoder()` 占位接口再裁回 top_k（占位原序返回，行为等价于直接取 top_k；将来接 bge-reranker 时只填这一个函数）。超参实验已穷尽：K∈{10,20,40,60,100}、系数∈{0,0.0001,0.0003,0.03} 共 9 组，hit@1 始终 59.5%（系数 0.03 会崩到 29.7%——重要性碾压相关性的量化反例）；**hit@1 的提升只能靠真 rerank 或查询改写，别再调参**。记忆内容是文档侧不加 bge 前缀，查询加。**改打分逻辑前后必须跑 `memory eval` 对比，指标不许回退**。
 
 记忆评测（`cmd_memory_eval`）：读 `eval/memory_eval.json`（JSON 数组，字段 query / expected_contains / expected_type），命中规则优先按 expected_contains 任一关键词匹配内容，没给关键词才退回比对 type；失败样本打印期望关键词 + top5 便于诊断。当前 37 题、29 条 demo 记忆下基线：hit@1 59.5% / hit@3 78.4% / hit@5 86.5% / MRR 0.690（比旧 12 题集低是因为题更难、库更大，**不要为拉高指标把 query 改写得和记忆原文一样**）。
 
