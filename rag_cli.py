@@ -2,12 +2,15 @@
 """
 rag_cli.py —— 阶段 0：最朴素的本地笔记 RAG 问答工具
 
-三个命令：
+命令一览：
     python rag_cli.py index  <笔记文件夹>     # 建索引（默认增量；支持 .md/.txt/.pdf）
-    python rag_cli.py search <问题>           # 混合检索：向量 + BM25，RRF 融合
+    python rag_cli.py search <问题>           # 混合检索：向量 + BM25，RRF 融合（--rerank 重排）
     python rag_cli.py ask    <问题>           # 检索 + 生成回答
                                               #   --backend claude（默认，需 ANTHROPIC_API_KEY）
                                               #   --backend ollama（本地模型，完全离线）
+    python rag_cli.py note   add/append/...   # 笔记增删改，改完自动更新索引
+    python rag_cli.py memory add/recall/...   # 个人记忆：记住 / 召回 / 遗忘（阶段 2）
+    python rag_cli.py eval   <测试集.jsonl>   # 检索质量评测：hit@k / MRR
 
 存储刻意保持朴素：embedding 直接存 numpy 数组，向量检索是暴力点积。
 个人笔记的量级（几千个片段）下这完全够用，也最利于理解 RAG 的每一步。
@@ -20,6 +23,7 @@ import math
 import re
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -488,6 +492,111 @@ def cmd_note_open(args):
     print(f"已打开 {f}。编辑保存后运行 python rag_cli.py index {args.folder} 更新索引")
 
 
+# ---------- 记忆系统（阶段 2 最小闭环）：手动记忆的 增 / 列 / 召回 / 遗忘 ----------
+#
+# 和"笔记检索"的本质区别：笔记是文档的切块，记忆是一条条独立的结构化事实，
+# 有类型（preference 偏好 / semantic 长期事实 / episodic 事件经历）和重要性。
+# 存储沿用 RAG 索引的约定：memories.json 与 embeddings.npy 按行号一一对应。
+
+MEMORY_DIR = Path(".memory_store")
+MEMORY_TYPES = ["preference", "semantic", "episodic"]
+
+
+def load_memories() -> tuple[list[dict], "np.ndarray | None"]:
+    mem_file = MEMORY_DIR / "memories.json"
+    memories = json.loads(mem_file.read_text(encoding="utf-8")) if mem_file.exists() else []
+    emb_file = MEMORY_DIR / "embeddings.npy"
+    embeddings = np.load(emb_file) if emb_file.exists() else None
+    if memories and (embeddings is None or len(memories) != len(embeddings)):
+        sys.exit("错误：.memory_store 里 memories.json 和 embeddings.npy 行数不一致，记忆库已损坏")
+    return memories, embeddings
+
+
+def save_memories(memories: list[dict], embeddings):
+    MEMORY_DIR.mkdir(exist_ok=True)
+    (MEMORY_DIR / "memories.json").write_text(
+        json.dumps(memories, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+    if embeddings is not None and len(embeddings):
+        np.save(MEMORY_DIR / "embeddings.npy", embeddings)
+    else:
+        (MEMORY_DIR / "embeddings.npy").unlink(missing_ok=True)
+
+
+def cmd_memory_add(args):
+    memories, embeddings = load_memories()
+    # id 取现存最大编号 +1。注意：删掉最大号后再 add 会复用该编号——
+    # 旧记忆已不存在所以无碍；将来若要 id 永不复用，需把计数器持久化
+    next_n = max((int(m["id"][1:]) for m in memories), default=0) + 1
+    now = datetime.now().isoformat(timespec="seconds")
+    mem = {
+        "id": f"m{next_n}",
+        "content": args.content,
+        "type": args.type,
+        "importance": args.importance,
+        "created_at": now,
+        "updated_at": now,
+        "source": "manual",  # 阶段 2 后期会有 "extracted"（从对话自动提取）
+        "tags": [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else [],
+    }
+    embedder = load_embedder()
+    # 记忆内容是"文档"一侧，按 bge 约定不加查询前缀
+    emb = embedder.encode([args.content], normalize_embeddings=True).astype(np.float32)
+    memories.append(mem)
+    embeddings = emb if embeddings is None else np.vstack([embeddings, emb])
+    save_memories(memories, embeddings)
+    print(f"已记住 [{mem['id']}]（{mem['type']}，重要性 {mem['importance']}）：{mem['content']}")
+
+
+def cmd_memory_list(args):
+    memories, _ = load_memories()
+    if not memories:
+        sys.exit('记忆库是空的。用 memory add "内容" --type semantic 添加一条')
+    for m in memories:
+        tags = f"  #{','.join(m['tags'])}" if m["tags"] else ""
+        print(
+            f"[{m['id']:>4}] {m['type']:<10} 重要性 {m['importance']}"
+            f"  {m['created_at'][:10]}  {m['content']}{tags}"
+        )
+    print(f"共 {len(memories)} 条记忆")
+
+
+def cmd_memory_recall(args):
+    """最小版记忆召回：向量相似度 + 重要性加权。
+
+    总分 = 余弦相似度 + 0.03 × importance。
+    0.03 的直觉：重要性从 1 到 5 最多抬 0.12 分——相似度接近时让重要记忆胜出，
+    但不至于让无关的高重要性记忆挤掉真正相关的。时间衰减、类型权重等留到后面，
+    加任何新打分因子前先在测试集上验证不回退。
+    """
+    memories, embeddings = load_memories()
+    if not memories:
+        sys.exit("记忆库是空的，没有可召回的内容")
+    embedder = load_embedder()
+    q = embedder.encode([QUERY_PREFIX + args.query], normalize_embeddings=True)[0]
+    sims = embeddings @ q
+    importance = np.array([m["importance"] for m in memories], dtype=np.float32)
+    finals = sims + 0.03 * importance
+    for rank, i in enumerate(np.argsort(finals)[::-1][: args.top_k], 1):
+        m = memories[int(i)]
+        print(
+            f"[{rank}] 总分 {finals[i]:.3f}（相似 {sims[i]:.3f} + 重要性 {m['importance']}×0.03）"
+            f"  {m['type']}  {m['id']}"
+        )
+        print(f"    {m['content']}")
+
+
+def cmd_memory_forget(args):
+    memories, embeddings = load_memories()
+    idx = next((i for i, m in enumerate(memories) if m["id"] == args.memory_id), None)
+    if idx is None:
+        sys.exit(f"错误：没有 id 为 {args.memory_id} 的记忆（用 memory list 查看）")
+    gone = memories.pop(idx)
+    embeddings = np.delete(embeddings, idx, axis=0)  # 同步删掉对应行，保持行号对齐
+    save_memories(memories, embeddings)
+    print(f"已遗忘 [{gone['id']}]：{gone['content']}")
+
+
 def cmd_eval(args):
     """跑问答测试集，量化检索质量。
 
@@ -581,6 +690,29 @@ def main():
     p_list = note_sub.add_parser("list", help="列出所有笔记")
     p_list.add_argument("--folder", default="sample_notes")
     p_list.set_defaults(func=cmd_note_list)
+
+    # memory 命令：阶段 2 记忆系统（结构同 note，二级子命令）
+    p_mem = sub.add_parser("memory", help="个人记忆：add / list / recall / forget")
+    mem_sub = p_mem.add_subparsers(dest="action", required=True)
+    p_madd = mem_sub.add_parser("add", help="记住一条记忆")
+    p_madd.add_argument("content", help="记忆内容（一条独立的事实/偏好/事件）")
+    p_madd.add_argument(
+        "--type", choices=MEMORY_TYPES, default="semantic",
+        help="preference=偏好 / semantic=长期事实（默认）/ episodic=事件经历",
+    )
+    p_madd.add_argument("--importance", type=int, choices=range(1, 6), default=3,
+                        help="重要性 1-5（默认 3），召回时加权")
+    p_madd.add_argument("--tags", default="", help="逗号分隔的标签，如 学习,项目")
+    p_madd.set_defaults(func=cmd_memory_add)
+    p_mlist = mem_sub.add_parser("list", help="列出所有记忆")
+    p_mlist.set_defaults(func=cmd_memory_list)
+    p_mrecall = mem_sub.add_parser("recall", help="按问题召回最相关的记忆")
+    p_mrecall.add_argument("query", help="要回忆什么")
+    p_mrecall.add_argument("-k", "--top-k", type=int, default=5)
+    p_mrecall.set_defaults(func=cmd_memory_recall)
+    p_mforget = mem_sub.add_parser("forget", help="按 id 删除一条记忆")
+    p_mforget.add_argument("memory_id", help="记忆 id，如 m3（memory list 可查）")
+    p_mforget.set_defaults(func=cmd_memory_forget)
 
     p_eval = sub.add_parser("eval", help="跑问答测试集，输出 hit@k / MRR 检索指标")
     p_eval.add_argument("testset", help="JSONL 测试集，每行含 question / expect_source / 可选 expect_text")

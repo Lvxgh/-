@@ -1,5 +1,7 @@
 # 机器本地产物，换机器后重建
 .venv/
 .rag_index/
+# 个人记忆数据，属于本人，不进公开仓库
+.memory_store/
 __pycache__/
 *.pyc

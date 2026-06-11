@@ -39,7 +39,15 @@ python rag_cli.py search "怎么创建虚拟环境" --rerank
 # 5. 跑问答测试集，量化检索命中率（hit@k / MRR）；加 --rerank 可对比重排前后的指标
 python rag_cli.py eval eval_questions.jsonl
 
-# 6. 管理笔记：增 / 改 / 删之后都会自动增量更新索引，改完立刻能搜到
+# 6. 个人记忆（阶段 2）：记住、召回、遗忘——和笔记不同，记忆是一条条带类型和重要性的独立事实
+python rag_cli.py memory add "用户喜欢先结论、短答。" --type preference --importance 5
+python rag_cli.py memory add "2026-06 完成阶段1评测。" --type episodic --importance 4
+python rag_cli.py memory recall "用户喜欢怎样的回答风格？" -k 3   # 相似度 + 重要性加权
+python rag_cli.py memory list
+python rag_cli.py memory forget m2
+# 记忆存在 .memory_store/（个人数据，不进 Git）
+
+# 7. 管理笔记：增 / 改 / 删之后都会自动增量更新索引，改完立刻能搜到
 python rag_cli.py note add "读书笔记-原子习惯" "核心观点：习惯是复利……"
 python rag_cli.py note append "读书笔记-原子习惯" "第二章：身份认同比目标更重要。"
 python rag_cli.py note open "读书笔记-原子习惯"     # 用默认编辑器打开做大段修改（改完手动 index）
@@ -61,6 +69,7 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 | `cmd_ask` | 片段注入 prompt，流式调用 Claude（云端）或 Ollama（本地）回答 |
 | `cmd_eval` | 跑 JSONL 问答测试集，输出 hit@1 / hit@k / MRR 检索指标 |
 | `cmd_note_*` | 笔记增/改/删/列表/打开，改动后调用 `do_index` 自动增量更新索引 |
+| `cmd_memory_*` | 个人记忆增/列/召回/遗忘；召回打分 = 余弦相似度 + 0.03×重要性 |
 
 ## 升级进度（阶段 1 清单）
 
@@ -73,4 +82,5 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 - [x] **评测工具**：`eval` 命令跑 JSONL 测试集，输出 hit@1 / hit@k / MRR
 - [x] **问答测试集**：50 条问答（`eval_questions.jsonl`，基于 11 篇模拟笔记），混合检索基线 hit@1 94% / MRR 0.970（阶段 1 收尾条件达成；换成真实笔记后照同样格式重建即可）
 - [x] **笔记管理**：`note add / append / delete / list / open`，增删改后自动增量更新索引
+- [x] **记忆系统最小闭环（阶段 2 第一步）**：`memory add / list / recall / forget`，三类记忆（preference/semantic/episodic）+ 重要性加权召回
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB
