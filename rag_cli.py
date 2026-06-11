@@ -561,14 +561,18 @@ def cmd_memory_list(args):
     print(f"共 {len(memories)} 条记忆")
 
 
-def recall_memories(query: str, top_k: int) -> list[dict]:
-    """记忆召回核心：向量相似度 + 重要性加权。recall 命令和 memory eval 共用，
-    保证评测的就是线上真实在跑的那套逻辑。
+# 重要性加分系数。RRF 里相邻名次的分差约 0.00026，取 0.0001 让重要性只在
+# 两条记忆排名接近时起"加时赛"作用，不至于让高重要性碾压真正相关的记忆。
+# v1 曾用 final = 相似度 + 0.03×importance，被 memory eval 量出两处反噬后改为混合检索。
+IMPORTANCE_COEF = 0.0001
 
-    总分 = 余弦相似度 + 0.03 × importance。
-    0.03 的直觉：重要性从 1 到 5 最多抬 0.12 分——相似度接近时让重要记忆胜出，
-    但不至于让无关的高重要性记忆挤掉真正相关的。时间衰减、类型权重等留到后面，
-    加任何新打分因子前先跑 memory eval 验证不回退。
+
+def recall_memories(query: str, top_k: int) -> list[dict]:
+    """记忆召回核心：混合检索（向量 + BM25，RRF 融合）+ 重要性微调。
+    recall 命令和 memory eval 共用，保证评测的就是线上真实在跑的那套逻辑。
+
+    和笔记检索的 retrieve() 同一套思路，直接复用 BM25 类和 tokenize。
+    改这里的任何打分逻辑，前后都要跑 memory eval 对比，指标不许回退。
     """
     memories, embeddings = load_memories()
     if not memories:
@@ -576,10 +580,26 @@ def recall_memories(query: str, top_k: int) -> list[dict]:
     embedder = load_embedder()
     q = embedder.encode([QUERY_PREFIX + query], normalize_embeddings=True)[0]
     sims = embeddings @ q
+    bm = BM25([tokenize(m["content"]) for m in memories]).scores(tokenize(query))
+
+    K = 60
+    rrf = np.zeros(len(memories), dtype=np.float32)
+    for r, i in enumerate(np.argsort(sims)[::-1]):
+        rrf[i] += 1 / (K + r + 1)
+    for r, i in enumerate(np.argsort(bm)[::-1]):
+        if bm[i] <= 0:  # 关键词完全不匹配的不参与
+            break
+        rrf[i] += 1 / (K + r + 1)
+
     importance = np.array([m["importance"] for m in memories], dtype=np.float32)
-    finals = sims + 0.03 * importance
+    finals = rrf + IMPORTANCE_COEF * importance
     return [
-        {**memories[int(i)], "final": float(finals[i]), "sim": float(sims[i])}
+        {
+            **memories[int(i)],
+            "final": float(finals[i]),
+            "sim": float(sims[i]),
+            "bm25": float(bm[i]),
+        }
         for i in np.argsort(finals)[::-1][:top_k]
     ]
 
@@ -587,8 +607,8 @@ def recall_memories(query: str, top_k: int) -> list[dict]:
 def cmd_memory_recall(args):
     for rank, m in enumerate(recall_memories(args.query, args.top_k), 1):
         print(
-            f"[{rank}] 总分 {m['final']:.3f}（相似 {m['sim']:.3f} + 重要性 {m['importance']}×0.03）"
-            f"  {m['type']}  {m['id']}"
+            f"[{rank}] 总分 {m['final']:.4f}（向量 {m['sim']:.3f} | BM25 {m['bm25']:.2f}"
+            f" | 重要性 {m['importance']}）  {m['type']}  {m['id']}"
         )
         print(f"    {m['content']}")
 

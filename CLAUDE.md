@@ -43,7 +43,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - [x] 最小闭环：`memory add/list/recall/forget`，三类记忆 + 重要性加权召回（`.memory_store/`，行号对齐同 RAG 索引）
 - [ ] 记忆提取：从对话/文档自动提取结构化记忆，分 episodic（事件）/ semantic（事实）/ preference（偏好）三类
 - [ ] 记忆生命周期：合并去重、冲突解决（新旧信息矛盾时如何更新）、时间衰减与遗忘策略
-- [ ] 记忆检索升级：相似度 + 时间 + 重要性 + 关联度的混合打分（现状：相似度 + 0.03×重要性）
+- [x] 记忆评测：`memory eval`（hit@1/3/5 + MRR，`eval/memory_eval.json` 12 题），改打分策略前后必跑、不许回退
+- [x] 记忆召回升级为混合检索：向量 + BM25 RRF 融合 + 0.0001×重要性微调（评测从 hit@1 66.7%/MRR 0.736 → 75%/0.847）
+- [ ] 记忆检索继续升级：时间衰减、关联度（动手前先扩评测集，12 题太少容易过拟合）
 - [ ] **评估体系**（求职含金量最高）：跑 LoCoMo、LongMemEval 等公开 benchmark；自建回归测试，改记忆策略指标不许倒退；LLM-as-judge 评估记忆质量
 - **里程碑**：至少一个公开 benchmark 上有可对比成绩，写技术博客分析结果
 
@@ -99,7 +101,11 @@ python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget
 
 评测：`cmd_eval` 读 JSONL 测试集（字段 `question` / `expect_source` / 可选 `expect_text`，命中=来源路径含 expect_source 且块文本含 expect_text），输出 hit@1 / hit@k / MRR。embedding 和 rerank 模型缓存在模块级变量（`_EMBEDDER` / `_RERANKER`），eval 连跑多题只加载一次。
 
-记忆系统（阶段 2，`cmd_memory_*`）：记忆存 `.memory_store/memories.json` + `embeddings.npy`，行号一一对应（同 RAG 索引约定，forget 时用 `np.delete` 同步删行）。每条记忆含 id（m1、m2…取最大号+1）/ content / type（preference/semantic/episodic）/ importance（1-5）/ created_at / updated_at / source（manual，将来有 extracted）/ tags。召回打分 = 余弦相似度 + 0.03×importance（记忆内容是文档侧不加 bge 前缀，查询加）。`.memory_store/` 是个人数据，已加入 .gitignore。
+记忆系统（阶段 2，`cmd_memory_*`）：记忆存 `.memory_store/memories.json` + `embeddings.npy`，行号一一对应（同 RAG 索引约定，forget 时用 `np.delete` 同步删行）。每条记忆含 id（m1、m2…取最大号+1）/ content / type（preference/semantic/episodic）/ importance（1-5）/ created_at / updated_at / source（manual，将来有 extracted）/ tags。`.memory_store/` 是个人数据，已加入 .gitignore。
+
+记忆召回（`recall_memories`，recall 命令与 memory eval 共用）：混合检索——向量余弦 + BM25（复用 RAG 的 BM25 类和 tokenize）RRF 融合，再加 `IMPORTANCE_COEF=0.0001 × importance` 微调（RRF 相邻名次分差约 0.00026，重要性只做"加时赛"）。记忆内容是文档侧不加 bge 前缀，查询加。**改打分逻辑前后必须跑 `memory eval` 对比，指标不许回退**；系数经过 0 / 0.0001 / 0.0003 敏感性对比选定。
+
+记忆评测（`cmd_memory_eval`）：读 `eval/memory_eval.json`（JSON 数组，字段 query / expected_contains / expected_type），命中规则优先按 expected_contains 任一关键词匹配内容，没给关键词才退回比对 type。当前 12 题、10 条 demo 记忆下：hit@1 75% / hit@3 100% / MRR 0.847。
 
 索引是**增量**的：`files.json` 存每个文件内容的 SHA-256，未变文件整体复用旧 embeddings 行（全复用时不加载模型）；`--rebuild` 强制全量。chunks 和 embeddings 按行号一一对应，任何改动必须保持这个对齐。
 
