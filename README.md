@@ -85,6 +85,7 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 - [x] **问答测试集**：50 条问答（`eval_questions.jsonl`，基于 11 篇模拟笔记），混合检索基线 hit@1 94% / MRR 0.970（阶段 1 收尾条件达成；换成真实笔记后照同样格式重建即可）
 - [x] **笔记管理**：`note add / append / delete / list / open`，增删改后自动增量更新索引
 - [x] **记忆系统最小闭环（阶段 2 第一步）**：`memory add / list / recall / forget`，三类记忆（preference/semantic/episodic）
-- [x] **记忆评测 + 混合召回（阶段 2 第二步）**：`memory eval`（12 题，hit@1/3/5 + MRR）；召回升级为向量+BM25 RRF 混合后 hit@1 66.7%→75%、MRR 0.736→0.847
+- [x] **记忆评测 + 混合召回（阶段 2 第二步）**：`memory eval`（hit@1/3/5 + MRR）；召回升级为向量+BM25 RRF 混合（12 题旧集 hit@1 66.7%→75%）
+- [x] **评测集扩厚（阶段 2 第四步）**：37 题 × 29 条记忆，同义/间接问法防刷分，失败样本输出 top5 详情；可信基线 hit@1 59.5% / hit@5 86.5% / MRR 0.690
 - [x] **记忆去重（阶段 2 第三步）**：`memory add` 自动查重，与已有记忆相似度 ≥0.92 时拒绝并提示，`--force` 可跳过
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB

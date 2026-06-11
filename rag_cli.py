@@ -666,6 +666,10 @@ def cmd_memory_eval(args):
             hit5 += 1
         mark = f"命中 rank={rank}" if rank else "未命中 ✗　"
         print(f"[{n:>2}] {mark}  {case['query']}")
+        if not rank:  # 失败样本输出详情，方便诊断是"没召回"还是"排太靠后"
+            print(f"     期望: {case.get('expected_contains') or '类型=' + case['expected_type']}")
+            for r, m in enumerate(hits, 1):
+                print(f"     top{r} [{m['type']:<10}] {m['content'][:36]}")
 
     n = len(cases)
     print("-" * 60)

@@ -44,9 +44,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - [ ] 记忆提取：从对话/文档自动提取结构化记忆，分 episodic（事件）/ semantic（事实）/ preference（偏好）三类
 - [x] 去重（最小版）：add 时与全库算余弦相似度，≥0.92（`DUP_THRESHOLD`）拒绝入库并提示已有记忆，`--force` 可跳过
 - [ ] 记忆生命周期（其余）：相似记忆合并、冲突解决（新旧信息矛盾时如何更新）、时间衰减与遗忘策略
-- [x] 记忆评测：`memory eval`（hit@1/3/5 + MRR，`eval/memory_eval.json` 12 题），改打分策略前后必跑、不许回退
-- [x] 记忆召回升级为混合检索：向量 + BM25 RRF 融合 + 0.0001×重要性微调（评测从 hit@1 66.7%/MRR 0.736 → 75%/0.847）
-- [ ] 记忆检索继续升级：时间衰减、关联度（动手前先扩评测集，12 题太少容易过拟合）
+- [x] 记忆评测：`memory eval`（hit@1/3/5 + MRR），改打分策略前后必跑、不许回退；失败样本自动打印期望关键词和 top5
+- [x] 记忆召回升级为混合检索：向量 + BM25 RRF 融合 + 0.0001×重要性微调（12 题旧集上 hit@1 66.7%→75%）
+- [x] 评测集扩充到 37 题（偏好 12 / 事实 13 / 事件 12，含 2 题仅按类型判定）+ 29 条 demo 记忆；问法刻意同义/间接化防刷分。**当前可信基线：hit@1 59.5% / hit@3 78.4% / hit@5 86.5% / MRR 0.690**——5 个失败全是"间接问法与记忆原文无词面交集"型，是后续 rerank/查询改写的素材
+- [ ] 记忆检索继续升级：rerank、时间衰减、关联度（以 37 题基线为准绳）
 - [ ] **评估体系**（求职含金量最高）：跑 LoCoMo、LongMemEval 等公开 benchmark；自建回归测试，改记忆策略指标不许倒退；LLM-as-judge 评估记忆质量
 - **里程碑**：至少一个公开 benchmark 上有可对比成绩，写技术博客分析结果
 
@@ -106,7 +107,7 @@ python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget
 
 记忆召回（`recall_memories`，recall 命令与 memory eval 共用）：混合检索——向量余弦 + BM25（复用 RAG 的 BM25 类和 tokenize）RRF 融合，再加 `IMPORTANCE_COEF=0.0001 × importance` 微调（RRF 相邻名次分差约 0.00026，重要性只做"加时赛"）。记忆内容是文档侧不加 bge 前缀，查询加。**改打分逻辑前后必须跑 `memory eval` 对比，指标不许回退**；系数经过 0 / 0.0001 / 0.0003 敏感性对比选定。
 
-记忆评测（`cmd_memory_eval`）：读 `eval/memory_eval.json`（JSON 数组，字段 query / expected_contains / expected_type），命中规则优先按 expected_contains 任一关键词匹配内容，没给关键词才退回比对 type。当前 12 题、10 条 demo 记忆下：hit@1 75% / hit@3 100% / MRR 0.847。
+记忆评测（`cmd_memory_eval`）：读 `eval/memory_eval.json`（JSON 数组，字段 query / expected_contains / expected_type），命中规则优先按 expected_contains 任一关键词匹配内容，没给关键词才退回比对 type；失败样本打印期望关键词 + top5 便于诊断。当前 37 题、29 条 demo 记忆下基线：hit@1 59.5% / hit@3 78.4% / hit@5 86.5% / MRR 0.690（比旧 12 题集低是因为题更难、库更大，**不要为拉高指标把 query 改写得和记忆原文一样**）。
 
 索引是**增量**的：`files.json` 存每个文件内容的 SHA-256，未变文件整体复用旧 embeddings 行（全复用时不加载模型）；`--rebuild` 强制全量。chunks 和 embeddings 按行号一一对应，任何改动必须保持这个对齐。
 
