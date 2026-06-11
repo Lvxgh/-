@@ -23,14 +23,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - [x] 增量索引（文件变更检测，不全量重建）
 - [x] 结构感知切块（Markdown 标题层级 + 标题路径上下文）
-- [x] 混合检索：手写 BM25 + 向量，RRF 融合（rerank 留待后续）
+- [x] 混合检索：手写 BM25 + 向量，RRF 融合
 - [x] PDF 接入（pypdf）
 - [x] Ollama 本地模型支持（`ask --backend ollama`，完全离线）
-- [ ] rerank：cross-encoder 对候选重排
+- [x] rerank：`--rerank` 用 cross-encoder（bge-reranker-base）对前 20 个候选重排
+- [x] 评测工具：`eval` 命令（hit@1 / hit@k / MRR），示例集 `eval_questions.jsonl`
 - [ ] 向量存储换 sqlite-vec / LanceDB（嵌入式、零运维）
 - [ ] 网页剪藏接入
 - [ ] 轻量 Web UI（CLI 优先）
-- [ ] 问答测试集（50-100 条，量化检索命中率）——阶段 1 收尾条件
+- [ ] 问答测试集（50-100 条，用用户真实笔记构建）——阶段 1 收尾条件，评测工具已就绪
 - **里程碑**：日常用它查自己的笔记，比直接搜文件好用
 - **检验标准**：用自己笔记构建 50-100 条问答测试集，检索命中率有量化数字
 
@@ -68,9 +69,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```powershell
 .venv\Scripts\Activate.ps1                  # 依赖：anthropic, sentence-transformers, numpy, pypdf
 python rag_cli.py index <笔记文件夹>         # 增量建索引（.md/.txt/.pdf），写入 .rag_index/
-python rag_cli.py search "<问题>" -k 5       # 混合检索，无需 API key
+python rag_cli.py search "<问题>" -k 5       # 混合检索，无需 API key；--rerank 开重排
 python rag_cli.py ask "<问题>"               # 检索+生成，需要 $env:ANTHROPIC_API_KEY
 python rag_cli.py ask "<问题>" --backend ollama  # 本地模型，完全离线（需安装 Ollama）
+python rag_cli.py eval eval_questions.jsonl  # 跑问答测试集，输出 hit@k / MRR
 ```
 
 没有测试和 lint 配置（阶段 0 刻意从简）。
@@ -85,9 +87,11 @@ python rag_cli.py ask "<问题>" --backend ollama  # 本地模型，完全离线
 
 单文件 `rag_cli.py`（~190 行）实现完整 RAG 管线：
 
-`read_document`（`.pdf` 用 pypdf 抽文本，其余按 UTF-8 读）→ `chunk_markdown`（`.md` 按标题层级切小节，块前缀「【标题路径】」；其余走 `chunk_text` 固定切块；超长小节滑窗细分）→ `cmd_index`（bge 向量化，存 `.rag_index/chunks.json` + `embeddings.npy` + `files.json` 文件指纹）→ `retrieve`（混合检索：向量余弦 + 手写 BM25 两路，RRF 融合，每路取前 50）→ `cmd_ask`（片段注入 prompt，`--backend claude` 流式调 Claude API（默认 `claude-opus-4-8`）或 `--backend ollama` 走本地 http://localhost:11434）。
+`read_document`（`.pdf` 用 pypdf 抽文本，其余按 UTF-8 读）→ `chunk_markdown`（`.md` 按标题层级切小节，块前缀「【标题路径】」；其余走 `chunk_text` 固定切块；超长小节滑窗细分）→ `cmd_index`（bge 向量化，存 `.rag_index/chunks.json` + `embeddings.npy` + `files.json` 文件指纹）→ `retrieve`（混合检索：向量余弦 + 手写 BM25 两路，RRF 融合，每路取前 50；`--rerank` 时对前 20 个候选用 cross-encoder `bge-reranker-base` 重排）→ `cmd_ask`（片段注入 prompt，`--backend claude` 流式调 Claude API（默认 `claude-opus-4-8`）或 `--backend ollama` 走本地 http://localhost:11434）。
 
 混合检索的约定：BM25 的中文分词是单字+双字滑窗（`tokenize`），BM25 索引在查询时现建（个人笔记量级下足够快）；RRF 只融合排名不融合分数，BM25 零分的块不参与融合。
+
+评测：`cmd_eval` 读 JSONL 测试集（字段 `question` / `expect_source` / 可选 `expect_text`，命中=来源路径含 expect_source 且块文本含 expect_text），输出 hit@1 / hit@k / MRR。embedding 和 rerank 模型缓存在模块级变量（`_EMBEDDER` / `_RERANKER`），eval 连跑多题只加载一次。
 
 索引是**增量**的：`files.json` 存每个文件内容的 SHA-256，未变文件整体复用旧 embeddings 行（全复用时不加载模型）；`--rebuild` 强制全量。chunks 和 embeddings 按行号一一对应，任何改动必须保持这个对齐。
 

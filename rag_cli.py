@@ -28,16 +28,34 @@ INDEX_DIR = Path(".rag_index")
 EMBED_MODEL = "BAAI/bge-small-zh-v1.5"  # 中文优先的小型 embedding 模型（~100MB，本地运行）
 # bge 系列模型要求：查询（短问题）加这个前缀，文档不加，检索效果才好
 QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
+RERANK_MODEL = "BAAI/bge-reranker-base"  # cross-encoder 重排模型（~1.1GB，仅 --rerank 时加载）
 DEFAULT_MODEL = "claude-opus-4-8"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b"
+
+# 模型加载很慢（数秒），缓存到模块级变量——eval 连续跑几十个问题时只加载一次
+_EMBEDDER = None
+_RERANKER = None
 
 
 def load_embedder():
     # 延迟导入：index/search 之外的命令（如 --help）不用等模型加载
-    from sentence_transformers import SentenceTransformer
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        from sentence_transformers import SentenceTransformer
 
-    print(f"加载 embedding 模型 {EMBED_MODEL}（首次运行会自动下载）...", file=sys.stderr)
-    return SentenceTransformer(EMBED_MODEL)
+        print(f"加载 embedding 模型 {EMBED_MODEL}（首次运行会自动下载）...", file=sys.stderr)
+        _EMBEDDER = SentenceTransformer(EMBED_MODEL)
+    return _EMBEDDER
+
+
+def load_reranker():
+    global _RERANKER
+    if _RERANKER is None:
+        from sentence_transformers import CrossEncoder
+
+        print(f"加载 rerank 模型 {RERANK_MODEL}（首次运行会自动下载）...", file=sys.stderr)
+        _RERANKER = CrossEncoder(RERANK_MODEL)
+    return _RERANKER
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)")
@@ -266,11 +284,15 @@ class BM25:
         return out
 
 
-def retrieve(query: str, top_k: int) -> list[dict]:
+def retrieve(query: str, top_k: int, rerank: bool = False) -> list[dict]:
     """混合检索：向量（语义）+ BM25（关键词）两路，RRF 融合排名。
 
     RRF（Reciprocal Rank Fusion）：每路只贡献 1/(60+名次)，
     不直接加分数——这样就不用纠结余弦相似度和 BM25 分数量纲不同的问题。
+
+    rerank=True 时再加一步 cross-encoder 重排：把查询和候选块**拼在一起**
+    送进模型逐对打分。比"查询、文档各自独立编码再比距离"（bi-encoder）精
+    准得多，但每对都要过一遍模型，慢——所以只对召回的前 20 个候选做。
     """
     chunks, embeddings = load_index()
 
@@ -295,8 +317,10 @@ def retrieve(query: str, top_k: int) -> list[dict]:
             break
         rrf[int(i)] += 1 / (K + r + 1)
 
-    top = sorted(rrf, key=lambda i: rrf[i], reverse=True)[:top_k]
-    return [
+    # rerank 时多召回一些候选（前 20），给重排留出"翻盘"空间
+    pool = max(top_k * 4, 20) if rerank else top_k
+    top = sorted(rrf, key=lambda i: rrf[i], reverse=True)[:pool]
+    hits = [
         {
             **chunks[i],
             "score": rrf[i],
@@ -306,12 +330,22 @@ def retrieve(query: str, top_k: int) -> list[dict]:
         for i in top
     ]
 
+    if rerank and hits:
+        reranker = load_reranker()
+        rr_scores = reranker.predict([(query, h["text"]) for h in hits])
+        for h, s in zip(hits, rr_scores):
+            h["rerank"] = float(s)
+        hits.sort(key=lambda h: h["rerank"], reverse=True)
+        hits = hits[:top_k]
+    return hits
+
 
 def cmd_search(args):
-    hits = retrieve(args.query, args.top_k)
+    hits = retrieve(args.query, args.top_k, rerank=args.rerank)
     for rank, h in enumerate(hits, 1):
+        rr = f"rerank {h['rerank']:.3f} | " if "rerank" in h else ""
         print(
-            f"\n[{rank}] RRF {h['score']:.4f}（向量 {h['vec']:.3f} | BM25 {h['bm25']:.2f}）"
+            f"\n[{rank}] {rr}RRF {h['score']:.4f}（向量 {h['vec']:.3f} | BM25 {h['bm25']:.2f}）"
             f"  来源: {h['source']} #{h['chunk_id']}"
         )
         print("-" * 60)
@@ -368,7 +402,7 @@ def ask_ollama(model: str, system: str, user_msg: str):
 
 
 def cmd_ask(args):
-    hits = retrieve(args.question, args.top_k)
+    hits = retrieve(args.question, args.top_k, rerank=args.rerank)
     context = "\n\n".join(
         f"<片段 来源=\"{h['source']}\">\n{h['text']}\n</片段>" for h in hits
     )
@@ -389,6 +423,55 @@ def cmd_ask(args):
     print()
 
 
+def cmd_eval(args):
+    """跑问答测试集，量化检索质量。
+
+    测试集是 JSONL，每行一个用例：
+        {"question": "怎么创建虚拟环境？", "expect_source": "python学习笔记", "expect_text": "venv"}
+    expect_source：命中块的来源文件路径须包含这个子串；
+    expect_text（可选）：命中块的文本还须包含这个子串（防止"碰巧召回同文件无关段落"算命中）。
+
+    指标：
+        hit@k —— 前 k 个结果里有命中的问题占比（k=1 和 k=top_k）
+        MRR  —— 平均倒数排名：命中排第 1 得 1 分、第 2 得 1/2、没命中 0 分，再求平均。
+                比 hit@k 更细腻：能反映"命中了，但排得靠不靠前"。
+    """
+    path = Path(args.testset)
+    if not path.exists():
+        sys.exit(f"错误：找不到测试集 {path}")
+    cases = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not cases:
+        sys.exit(f"错误：{path} 是空的")
+
+    hit1 = hitk = 0
+    mrr = 0.0
+    for n, case in enumerate(cases, 1):
+        hits = retrieve(case["question"], args.top_k, rerank=args.rerank)
+        rank = 0  # 0 表示没命中
+        for r, h in enumerate(hits, 1):
+            if case["expect_source"] in h["source"] and case.get("expect_text", "") in h["text"]:
+                rank = r
+                break
+        if rank == 1:
+            hit1 += 1
+        if rank:
+            hitk += 1
+            mrr += 1 / rank
+        mark = f"命中@{rank}" if rank else "未命中 ✗"
+        print(f"[{n:>2}] {mark:　<6} {case['question']}")
+
+    n = len(cases)
+    print("-" * 60)
+    print(
+        f"共 {n} 题 | hit@1 {hit1 / n:.0%} | hit@{args.top_k} {hitk / n:.0%}"
+        f" | MRR {mrr / n:.3f}" + ("（已开启 rerank）" if args.rerank else "")
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="本地笔记 RAG 问答工具（阶段 0）")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -401,17 +484,25 @@ def main():
     p_search = sub.add_parser("search", help="检索最相关的笔记片段")
     p_search.add_argument("query", help="查询内容")
     p_search.add_argument("-k", "--top-k", type=int, default=5)
+    p_search.add_argument("--rerank", action="store_true", help="用 cross-encoder 对候选重排（更准但更慢）")
     p_search.set_defaults(func=cmd_search)
 
     p_ask = sub.add_parser("ask", help="检索并基于笔记生成回答")
     p_ask.add_argument("question", help="要问的问题")
     p_ask.add_argument("-k", "--top-k", type=int, default=5)
+    p_ask.add_argument("--rerank", action="store_true", help="用 cross-encoder 对候选重排（更准但更慢）")
     p_ask.add_argument(
         "--backend", choices=["claude", "ollama"], default="claude",
         help="claude=云端 API（默认）；ollama=本地模型，完全离线",
     )
     p_ask.add_argument("--model", default=None, help="模型名，不填则按后端用默认值")
     p_ask.set_defaults(func=cmd_ask)
+
+    p_eval = sub.add_parser("eval", help="跑问答测试集，输出 hit@k / MRR 检索指标")
+    p_eval.add_argument("testset", help="JSONL 测试集，每行含 question / expect_source / 可选 expect_text")
+    p_eval.add_argument("-k", "--top-k", type=int, default=5)
+    p_eval.add_argument("--rerank", action="store_true", help="开启重排后再评测，便于对比效果")
+    p_eval.set_defaults(func=cmd_eval)
 
     args = parser.parse_args()
     args.func(args)

@@ -1,0 +1,10 @@
+{"question": "怎么创建虚拟环境？", "expect_source": "python学习笔记", "expect_text": "venv"}
+{"question": "列表推导式带条件怎么写？", "expect_source": "python学习笔记", "expect_text": "推导式"}
+{"question": "Python 里异常处理有什么注意点？", "expect_source": "python学习笔记", "expect_text": "except"}
+{"question": "命令行工具的子命令结构用什么实现？", "expect_source": "python学习笔记", "expect_text": "argparse"}
+{"question": "字符串插值的简洁写法是什么？", "expect_source": "python学习笔记", "expect_text": "f-string"}
+{"question": "git stash 是干什么用的？", "expect_source": "git笔记"}
+{"question": "如何新建一个分支？", "expect_source": "git笔记", "expect_text": "switch"}
+{"question": "这个项目的口号是什么？", "expect_source": "项目计划", "expect_text": "属于你自己"}
+{"question": "记忆提取和遗忘策略在哪个阶段做？", "expect_source": "项目计划", "expect_text": "阶段 2"}
+{"question": "向量存储以后打算换成什么？", "expect_source": "项目计划", "expect_text": "sqlite-vec"}

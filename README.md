@@ -32,6 +32,12 @@ python rag_cli.py ask "这个项目分几个阶段？"
 
 # 3b. 或者走本地 Ollama，完全离线（需要先安装 https://ollama.com 并 pull 模型）
 python rag_cli.py ask "这个项目分几个阶段？" --backend ollama
+
+# 4. 检索质量不够时，加 --rerank 用 cross-encoder 重排（更准但更慢，首次下载约 1.1GB 模型）
+python rag_cli.py search "怎么创建虚拟环境" --rerank
+
+# 5. 跑问答测试集，量化检索命中率（hit@k / MRR）；加 --rerank 可对比重排前后的指标
+python rag_cli.py eval eval_questions.jsonl
 ```
 
 把 `sample_notes` 换成你自己的笔记文件夹（支持 `.md` / `.txt` / `.pdf`，递归扫描）。
@@ -43,8 +49,9 @@ python rag_cli.py ask "这个项目分几个阶段？" --backend ollama
 | `chunk_markdown` / `chunk_text` | Markdown 按标题层级切小节（带标题路径）；纯文本按段落切 ~500 字块 |
 | `cmd_index` | 增量索引：新增/修改的块向量化后存盘，未变文件复用旧向量 |
 | `tokenize` / `BM25` | 中英文轻量分词 + 手写教科书版 BM25 |
-| `retrieve` | 混合检索：向量与 BM25 两路排名，RRF 融合取 top-k |
+| `retrieve` | 混合检索：向量与 BM25 两路排名，RRF 融合取 top-k；可选 cross-encoder 重排 |
 | `cmd_ask` | 片段注入 prompt，流式调用 Claude（云端）或 Ollama（本地）回答 |
+| `cmd_eval` | 跑 JSONL 问答测试集，输出 hit@1 / hit@k / MRR 检索指标 |
 
 ## 升级进度（阶段 1 清单）
 
@@ -53,6 +60,7 @@ python rag_cli.py ask "这个项目分几个阶段？" --backend ollama
 - [x] **混合检索**：向量（语义）+ 手写 BM25（关键词，中文用单字+双字分词）两路，RRF 倒数排名融合；`search` 会显示每路的分数
 - [x] **PDF 接入**：`index` 支持 `.pdf`（pypdf 逐页抽取文本）
 - [x] **本地模型**：`ask --backend ollama` 走本地 Ollama（默认 `qwen3:4b`），完全离线；`--backend claude`（默认）走云端
-- [ ] **rerank**：用 cross-encoder 对候选重排，进一步提升精度
+- [x] **rerank**：`--rerank` 用 cross-encoder（`bge-reranker-base`）对召回的前 20 个候选重排
+- [x] **评测工具**：`eval` 命令跑 JSONL 测试集，输出 hit@1 / hit@k / MRR；`eval_questions.jsonl` 是 10 条示例
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB
-- [ ] **问答测试集**：用自己的真实笔记构建 50-100 条评测集，量化检索命中率（阶段 1 收尾条件）
+- [ ] **问答测试集**：用自己的真实笔记构建 50-100 条评测集，量化检索命中率（阶段 1 收尾条件；工具已就绪，需要真实笔记+真实问题）
