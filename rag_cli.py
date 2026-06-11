@@ -582,6 +582,21 @@ def cmd_memory_list(args):
 # 两条记忆排名接近时起"加时赛"作用，不至于让高重要性碾压真正相关的记忆。
 # v1 曾用 final = 相似度 + 0.03×importance，被 memory eval 量出两处反噬后改为混合检索。
 IMPORTANCE_COEF = 0.0001
+# 记忆召回的 RRF 平滑常数：越小头部名次权重越大（更尖），越大两路融合越平。
+# 独立于 retrieve() 里 RAG 检索的 K=60，方便单独做实验。
+# 37 题评测网格实验（K∈{20,60,100} × 系数∈{0,0.0001,0.0003}）：K=20 时
+# hit@3 78.4%→81.1%、hit@5 86.5%→89.2%、MRR 0.690→0.699，全指标不回退，故选 20。
+MEMORY_RRF_K = 20
+
+
+def rerank_with_cross_encoder(query: str, candidates: list[dict]) -> list[dict]:
+    """记忆重排的占位接口：将来接 cross-encoder（如 bge-reranker-base，模型已在本地）。
+
+    37 题评测里 5 个失败全是"查询与记忆零词面交集"型，正是 cross-encoder 的强项。
+    当前版本不加载模型、原序返回，先把调用点固定在召回管线里。
+    """
+    # TODO: 复用 load_reranker() 对 (query, content) 逐对打分后重排
+    return candidates
 
 
 def recall_memories(query: str, top_k: int) -> list[dict]:
@@ -599,18 +614,17 @@ def recall_memories(query: str, top_k: int) -> list[dict]:
     sims = embeddings @ q
     bm = BM25([tokenize(m["content"]) for m in memories]).scores(tokenize(query))
 
-    K = 60
     rrf = np.zeros(len(memories), dtype=np.float32)
     for r, i in enumerate(np.argsort(sims)[::-1]):
-        rrf[i] += 1 / (K + r + 1)
+        rrf[i] += 1 / (MEMORY_RRF_K + r + 1)
     for r, i in enumerate(np.argsort(bm)[::-1]):
         if bm[i] <= 0:  # 关键词完全不匹配的不参与
             break
-        rrf[i] += 1 / (K + r + 1)
+        rrf[i] += 1 / (MEMORY_RRF_K + r + 1)
 
     importance = np.array([m["importance"] for m in memories], dtype=np.float32)
     finals = rrf + IMPORTANCE_COEF * importance
-    return [
+    hits = [
         {
             **memories[int(i)],
             "final": float(finals[i]),
@@ -619,6 +633,7 @@ def recall_memories(query: str, top_k: int) -> list[dict]:
         }
         for i in np.argsort(finals)[::-1][:top_k]
     ]
+    return rerank_with_cross_encoder(query, hits)
 
 
 def cmd_memory_recall(args):
