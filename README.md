@@ -64,6 +64,9 @@ python rag_cli.py memory consolidate                     # 全库体检：扫相
                                                          # --save-pending 把建议存入待审清单（库本身仍不动）
 python rag_cli.py memory lifecycle-eval                  # 评测上面两个 LLM 守门判断的准确率（30 题静态评测集，
                                                          # 不碰记忆库）；--model 可对比 deepseek-v4-pro / v4-flash
+# 模型分工：ask/extract 等生成类默认 deepseek-v4-pro；review/consolidate 的守门判断
+# 默认 deepseek-v4-flash（30 题评测同分、更便宜），判断拿不准（低置信度/解析失败）时
+# 自动用 pro 复核一次（--no-fallback 关闭）。显式 --model 永远优先。改库始终要人工确认。
 # ask 会自动注入 top3 相关记忆，让回答贴合你的偏好和背景（--no-memory 关闭）
 # 记忆存在 .memory_store/（个人数据，不进 Git）。评测前先按 eval/memory_eval.json
 # 的预期内容添加 demo 记忆（见仓库提交历史或 CLAUDE.md）
@@ -114,4 +117,5 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 - [x] **记忆生命周期最小闭环（阶段 2 第七步）**：`memory update`（部分字段更新+重算向量）、`memory merge`（手动合并两条）；`extract --review` 让 LLM 守门员判断每条候选该 add/duplicate/update/conflict/ignore，存入待审清单（`memory pending list/apply/reject`），LLM 只建议、改库必须人工确认。5 个场景测试（重复/偏好冲突/补充更新/琐事/独立新增）全部判对
 - [x] **全库记忆体检（阶段 2 第八步）**：`memory consolidate` 用现成 embeddings 两两扫相似对（阈值 0.82 可调、同 type 优先、上限 20 对控制成本），LLM 逐对判断 keep/duplicate/merge/conflict。默认 dry-run；`--save-pending` 接入待审清单，merge/duplicate 可一键 apply，conflict 强制人工处理。4 类场景（重复/可合并/冲突/只是相关）全部判对
 - [x] **生命周期判断评测（阶段 2 第九步）**：`memory lifecycle-eval`，30 题静态评测集（`eval/memory_lifecycle_eval.json`，action 五动作 15 题 + pair 四动作 15 题）量化两个守门判断的准确率。v4-pro 与 v4-flash 均 **93.3%**（28/30，错的是同两道 merge/keep 边界题）——守门场景可以放心用更便宜的 flash
+- [x] **守门员模型路由（阶段 2 第十步）**：生成类（ask/extract 提取）默认 pro、守门判断默认 flash；judge 输出带 confidence（1-5），低置信度/解析失败/缺 target 时自动用 pro 复核一次（`judge_with_fallback`，--no-fallback 关闭）。实测注意：边界题上模型会"自信地错"（conf 5），置信度路由抓不到这类错——所以改库必须人工确认这条原则不变
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB

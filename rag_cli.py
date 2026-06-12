@@ -37,14 +37,26 @@ QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 RERANK_MODEL = "BAAI/bge-reranker-base"  # cross-encoder 重排模型（~1.1GB，仅 --rerank 时加载）
 DEFAULT_MODEL = "claude-opus-4-8"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b"
-DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"  # DeepSeek 云端 API（OpenAI 兼容格式）
+# DeepSeek 云端 API（OpenAI 兼容格式）。模型按任务分工，不要把模型名散落在各函数里：
+# - 生成类（ask 回答、extract 提取）用强模型 pro；
+# - 守门判断（review/consolidate 的 judge）默认用便宜的 flash——30 题 lifecycle-eval
+#   实测与 pro 同分（93.3%），拿不准（低置信度/解析失败）时再用 pro 复核一次
+DEFAULT_ASK_MODEL = "deepseek-v4-pro"
+DEFAULT_JUDGE_MODEL = "deepseek-v4-flash"
+DEFAULT_FALLBACK_JUDGE_MODEL = "deepseek-v4-pro"
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 
 
 def default_model(backend: str) -> str:
     """--model 未指定时，按后端选默认模型。"""
     return {"claude": DEFAULT_MODEL, "ollama": DEFAULT_OLLAMA_MODEL,
-            "deepseek": DEFAULT_DEEPSEEK_MODEL}[backend]
+            "deepseek": DEFAULT_ASK_MODEL}[backend]
+
+
+def judge_model(backend: str, model: str | None) -> str:
+    """守门判断（judge_memory_action / judge_memory_pair）的模型选择：
+    用户显式 --model 优先；deepseek 默认用便宜的 flash；其他后端沿用各自默认。"""
+    return model or (DEFAULT_JUDGE_MODEL if backend == "deepseek" else default_model(backend))
 
 
 def pick_backend(backend: str | None) -> str:
@@ -817,8 +829,17 @@ JUDGE_PROMPT = (
     '{"action": "add/duplicate/update/conflict/ignore 五选一", '
     '"target_id": "涉及的那条已有记忆的 id（duplicate/update/conflict 必填，add/ignore 填 null）", '
     '"merged_content": "update/conflict 时给出建议的更新后内容（一句完整陈述），其余填 null", '
-    '"reason": "一句话原因"}'
+    '"reason": "一句话原因", '
+    '"confidence": "1-5 的整数：5=非常确定，4=比较确定，3=有点不确定，2=不确定，1=很不确定"}'
 )
+
+
+def parse_confidence(obj: dict) -> int:
+    """从 LLM 输出里取 confidence，夹到 1-5；没给或不是数字按 3（有点不确定）处理。"""
+    try:
+        return max(1, min(5, int(obj.get("confidence", 3))))
+    except (TypeError, ValueError):
+        return 3
 
 
 def judge_memory_action(new_memory: dict, candidates: list[dict],
@@ -848,16 +869,43 @@ def judge_memory_action(new_memory: dict, candidates: list[dict],
     if action not in ("add", "duplicate", "update", "conflict", "ignore"):
         print(f"[警告：LLM 输出无法解析。原始输出：{reply[:300]}]", file=sys.stderr)
         return {"action": "conflict", "target_id": None, "merged_content": None,
-                "reason": f"LLM 输出无法解析（动作={action!r}），需要人工判断"}
+                "reason": f"LLM 输出无法解析（动作={action!r}），需要人工判断",
+                "confidence": 1, "uncertain": True}
     target = obj.get("target_id")
     if target not in {m["id"] for m in candidates}:
         target = None  # LLM 偶尔会编一个不存在的 id，编的一律作废
     reason = str(obj.get("reason") or "").strip() or "（LLM 没给原因）"
+    uncertain = False  # 该给 target 没给 ≈ 判断不可靠，路由层可据此触发复核
     if action in ("duplicate", "update", "conflict") and target is None:
         reason += "（注意：LLM 未给出有效 target_id）"
+        uncertain = True
     merged = obj.get("merged_content")
     merged = str(merged).strip() if merged and str(merged).strip().lower() != "null" else None
-    return {"action": action, "target_id": target, "merged_content": merged, "reason": reason}
+    return {"action": action, "target_id": target, "merged_content": merged,
+            "reason": reason, "confidence": parse_confidence(obj), "uncertain": uncertain}
+
+
+def judge_with_fallback(judge_call, backend: str, model: str, fallback: bool) -> dict:
+    """守门员模型路由：先用便宜模型判断，拿不准时换强模型复核一次。
+
+    judge_call 是"接收模型名、返回 verdict"的单参函数（调用方用 lambda 绑好其余参数，
+    这样 action 判断和 pair 判断可以共用同一个路由）。
+    触发复核的条件：解析失败 / 该给 target_id 没给（uncertain 标记）/ confidence <= 3。
+    只在 deepseek 后端、且第一次用的不是复核模型本身时才会复核。
+    复核结果带 fallback_from / first_action 字段标明路由轨迹；
+    无论哪个模型判的都只是建议，真正改库仍要人工 pending apply。
+    """
+    verdict = judge_call(model)
+    verdict["model"] = model
+    unsure = verdict.get("uncertain") or verdict.get("confidence", 3) <= 3
+    if not (fallback and unsure and backend == "deepseek"
+            and model != DEFAULT_FALLBACK_JUDGE_MODEL):
+        return verdict
+    second = judge_call(DEFAULT_FALLBACK_JUDGE_MODEL)
+    second["model"] = DEFAULT_FALLBACK_JUDGE_MODEL
+    second["fallback_from"] = model
+    second["first_action"] = verdict["action"]  # 复核前的判断，评测时对比复核值不值
+    return second
 
 
 # ---------- 全库记忆体检（consolidate）：扫描存量记忆里的重复/可合并/冲突 ----------
@@ -880,7 +928,8 @@ JUDGE_PAIR_PROMPT = (
     "只输出一个 JSON 对象，不要任何其他文字：\n"
     '{"action": "keep/duplicate/merge/conflict 四选一", '
     '"merged_content": "merge 时给出合并后的内容（一句完整陈述），其余填 null", '
-    '"reason": "一句话原因"}'
+    '"reason": "一句话原因", '
+    '"confidence": "1-5 的整数：5=非常确定，4=比较确定，3=有点不确定，2=不确定，1=很不确定"}'
 )
 
 
@@ -903,11 +952,13 @@ def judge_memory_pair(mem_a: dict, mem_b: dict, backend: str, model: str) -> dic
     action = obj.get("action")
     if action not in ("keep", "duplicate", "merge", "conflict"):
         print(f"[警告：LLM 输出无法解析，按 keep 处理。原始输出：{reply[:300]}]", file=sys.stderr)
-        return {"action": "keep", "merged_content": None, "reason": "LLM 输出无法解析，保守不动"}
+        return {"action": "keep", "merged_content": None, "reason": "LLM 输出无法解析，保守不动",
+                "confidence": 1, "uncertain": True}
     merged = obj.get("merged_content")
     merged = str(merged).strip() if merged and str(merged).strip().lower() != "null" else None
     reason = str(obj.get("reason") or "").strip() or "（LLM 没给原因）"
-    return {"action": action, "merged_content": merged, "reason": reason}
+    return {"action": action, "merged_content": merged, "reason": reason,
+            "confidence": parse_confidence(obj), "uncertain": False}
 
 
 def find_similar_pairs(memories: list[dict], embeddings,
@@ -945,16 +996,22 @@ def cmd_memory_consolidate(args):
         return
 
     backend = pick_backend(args.backend)
-    model = args.model or default_model(backend)
-    print(f"[{backend}/{model} 逐对判断中...]", file=sys.stderr)
+    model = judge_model(backend, args.model)
+    fallback = not args.no_fallback
+    fb_note = f"，拿不准时 {DEFAULT_FALLBACK_JUDGE_MODEL} 复核" if fallback else ""
+    print(f"[{backend}/{model} 逐对判断中...{fb_note}]", file=sys.stderr)
     actionable = []  # keep 之外的建议，--save-pending 时存入待审清单
     for n, (sim, i, j) in enumerate(pairs, 1):
         a, b = memories[i], memories[j]
-        verdict = judge_memory_pair(a, b, backend, model)
+        verdict = judge_with_fallback(
+            lambda mdl: judge_memory_pair(a, b, backend, mdl), backend, model, fallback)
         print(f"\n[{n}] 相似度 {sim:.3f}")
         print(f"{a['id']}: [{a['type']}] {a['content']}")
         print(f"{b['id']}: [{b['type']}] {b['content']}")
-        print(f"建议：{verdict['action']}")
+        print(f"建议：{verdict['action']}（confidence {verdict['confidence']}）")
+        if verdict.get("fallback_from"):
+            print(f"fallback: {verdict['fallback_from']} → {verdict['model']} 复核"
+                  f"（第一次判断是 {verdict['first_action']}）")
         if verdict["merged_content"]:
             print(f"合并草稿：{verdict['merged_content']}")
         print(f"原因：{verdict['reason']}")
@@ -978,6 +1035,7 @@ def cmd_memory_consolidate(args):
             "action": verdict["action"], "target_ids": [a["id"], b["id"]],
             "contents": [a["content"], b["content"]],  # 快照，pending list 展示用
             "merged_content": verdict["merged_content"], "reason": verdict["reason"],
+            "confidence": verdict["confidence"],
             "created_at": datetime.now().isoformat(timespec="seconds"),
         })
         next_p += 1
@@ -1000,29 +1058,45 @@ def cmd_memory_lifecycle_eval(args):
         sys.exit(f"错误：{path} 是空的")
 
     backend = pick_backend(args.backend)
-    model = args.model or default_model(backend)
-    print(f"记忆生命周期判断评测：{path} | {backend}/{model} | 共 {len(cases)} 题")
+    # 默认不开 fallback：评测就是要量化单个模型，混入复核会看不清各自的真实水平
+    model = judge_model(backend, args.model)
+    use_fb = args.fallback_pro
+    fb_note = f"（拿不准时 {DEFAULT_FALLBACK_JUDGE_MODEL} 复核）" if use_fb else ""
+    print(f"记忆生命周期判断评测：{path} | {backend}/{model}{fb_note} | 共 {len(cases)} 题")
 
     task_stats = defaultdict(lambda: [0, 0])    # task -> [对, 总]
     action_stats = defaultdict(lambda: [0, 0])  # 期望动作 -> [对, 总]
-    failures = []
+    failures, low_conf, confs = [], [], []
+    n_fallback = n_before_ok = 0
     for n, case in enumerate(cases, 1):
         if case["task"] == "action":
-            verdict = judge_memory_action(case["new_memory"], case["existing_candidates"],
-                                          backend, model)
+            judge_call = lambda mdl, c=case: judge_memory_action(
+                c["new_memory"], c["existing_candidates"], backend, mdl)
         else:
-            verdict = judge_memory_pair(case["memory_a"], case["memory_b"], backend, model)
+            judge_call = lambda mdl, c=case: judge_memory_pair(
+                c["memory_a"], c["memory_b"], backend, mdl)
+        verdict = judge_with_fallback(judge_call, backend, model, use_fb)
         expected, got = case["expected_action"], verdict["action"]
+        conf = verdict["confidence"]
+        confs.append(conf)
+        fb = "fallback_from" in verdict
+        n_fallback += fb
         # 解析失败时守门函数会返回保守动作（conflict/keep），就算碰巧等于期望也算失败——
         # 那是兜底救的，不是模型判断对的
         parse_failed = "无法解析" in verdict["reason"]
         ok = got == expected and not parse_failed
+        # 复核前的成绩：发生过复核就看第一次判断的动作（粗算），没复核就等于本题结果
+        n_before_ok += (verdict["first_action"] == expected) if fb else ok
         task_stats[case["task"]][0] += ok
         task_stats[case["task"]][1] += 1
         action_stats[expected][0] += ok
         action_stats[expected][1] += 1
         mark = "✓" if ok else "✗"
-        print(f"[{n:>2}] {mark} {case['task']:<6} 期望 {expected:<9} 得到 {got:<9} {case['name']}")
+        fb_mark = " ↻复核" if fb else ""
+        print(f"[{n:>2}] {mark} {case['task']:<6} 期望 {expected:<9} 得到 {got:<9}"
+              f" conf {conf}{fb_mark}  {case['name']}")
+        if conf <= 3:
+            low_conf.append((n, case, got, conf))
         if not ok:
             failures.append((n, case, got, verdict["reason"]))
 
@@ -1034,6 +1108,14 @@ def cmd_memory_lifecycle_eval(args):
         f"{t} {s[0]}/{s[1]} = {s[0] / s[1]:.1%}" for t, s in sorted(task_stats.items())))
     print("分动作：" + "  ".join(
         f"{a} {s[0]}/{s[1]}" for a, s in sorted(action_stats.items())))
+    print(f"平均 confidence：{sum(confs) / total:.1f} | fallback 触发：{n_fallback} 次")
+    if use_fb:
+        print(f"复核前准确率：{n_before_ok}/{total} = {n_before_ok / total:.1%}"
+              f" → 复核后：{n_ok}/{total} = {n_ok / total:.1%}")
+    if low_conf:
+        print("\n低置信度样本（confidence <= 3）：")
+        for n, case, got, conf in low_conf:
+            print(f"[{n}] 期望 {case['expected_action']}，得到 {got}，confidence={conf}  {case['name']}")
     if failures:
         print("\n失败样本：")
         for n, case, got, reason in failures:
@@ -1062,7 +1144,9 @@ def cmd_memory_extract(args):
         sys.exit("没有提取到任何记忆（模型输出格式不对，或文本里没有可提取的内容）")
 
     if args.review:
-        review_candidates(extracted, backend, model)
+        # 注意：上面的提取（生成类任务）用的是 model（默认 pro），
+        # 守门判断的模型在 review_candidates 里单独选（默认 flash）
+        review_candidates(extracted, backend, args.model, fallback=not args.no_fallback)
         return
 
     n_added = n_dup = 0
@@ -1099,18 +1183,25 @@ def save_pending(items: list[dict]):
     PENDING_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def review_candidates(extracted: list[dict], backend: str, model: str):
+def review_candidates(extracted: list[dict], backend: str, user_model: str | None,
+                      fallback: bool = True):
     """--review 模式：每条候选先召回 top5 相似旧记忆，让 LLM 判断动作。
 
     只打印建议并存入待审清单，不写记忆库——这是 extract 的安全模式，
     防止自动提取的内容（重复、偏好反转）不经确认就污染长期记忆。
+    守门判断默认用便宜的 flash，拿不准时 pro 复核（--no-fallback 关闭复核）。
     """
+    jmodel = judge_model(backend, user_model)
+    fb_note = f"，拿不准时 {DEFAULT_FALLBACK_JUDGE_MODEL} 复核" if fallback else ""
+    print(f"[守门判断：{backend}/{jmodel}{fb_note}]", file=sys.stderr)
     memories, _ = load_memories()
     pending = load_pending()
     next_p = max((int(p["id"][1:]) for p in pending), default=0) + 1
     for n, em in enumerate(extracted, 1):
         candidates = recall_memories(em["content"], 5) if memories else []
-        verdict = judge_memory_action(em, candidates, backend, model)
+        verdict = judge_with_fallback(
+            lambda mdl: judge_memory_action(em, candidates, backend, mdl),
+            backend, jmodel, fallback)
         item = {"id": f"p{next_p}", "candidate": em, **verdict,
                 "created_at": datetime.now().isoformat(timespec="seconds")}
         pending.append(item)
@@ -1119,7 +1210,10 @@ def review_candidates(extracted: list[dict], backend: str, model: str):
         print(f"content: {em['content']}")
         print(f"type: {em['type']}    importance: {em['importance']}")
         target = f"  target: {verdict['target_id']}" if verdict["target_id"] else ""
-        print(f"LLM 建议：{verdict['action']}{target}")
+        print(f"LLM 建议：{verdict['action']}{target}（confidence {verdict['confidence']}）")
+        if verdict.get("fallback_from"):
+            print(f"fallback: {verdict['fallback_from']} → {verdict['model']} 复核"
+                  f"（第一次判断是 {verdict['first_action']}）")
         if verdict["merged_content"]:
             print(f"merged_content: {verdict['merged_content']}")
         print(f"reason: {verdict['reason']}")
@@ -1613,7 +1707,10 @@ def main():
                          help="把 keep 之外的建议存入待审清单（库本身仍不动，之后 memory pending apply 执行）")
     p_mcons.add_argument("--backend", choices=["claude", "deepseek", "ollama"], default=None,
                          help="不填则自动检测（同 ask）")
-    p_mcons.add_argument("--model", default=None, help="模型名，不填按后端用默认值")
+    p_mcons.add_argument("--model", default=None,
+                         help="模型名，不填守门判断默认用 deepseek-v4-flash（评测与 pro 同分）")
+    p_mcons.add_argument("--no-fallback", action="store_true", dest="no_fallback",
+                         help="默认拿不准时用 pro 复核；加这个关闭复核（只用 flash）")
     p_mcons.set_defaults(func=cmd_memory_consolidate)
     p_mlce = mem_sub.add_parser("lifecycle-eval",
                                 help="评测 LLM 守门判断准确率（extract 的五动作 + consolidate 的四动作），静态评测集不碰记忆库")
@@ -1622,7 +1719,9 @@ def main():
     p_mlce.add_argument("--backend", choices=["claude", "deepseek", "ollama"], default=None,
                         help="不填则自动检测（同 ask）")
     p_mlce.add_argument("--model", default=None,
-                        help="模型名，不填按后端用默认值（可用来对比 deepseek-v4-pro 和 deepseek-v4-flash）")
+                        help="模型名，不填默认 deepseek-v4-flash（可用来对比 deepseek-v4-pro 和 deepseek-v4-flash）")
+    p_mlce.add_argument("--fallback-pro", action="store_true", dest="fallback_pro",
+                        help="低置信度时用 pro 复核（默认关——评测单模型时不要混入另一个模型）")
     p_mlce.set_defaults(func=cmd_memory_lifecycle_eval)
     p_mpend = mem_sub.add_parser("pending", help="待审清单：处理 extract --review / consolidate --save-pending 存下的候选")
     pend_sub = p_mpend.add_subparsers(dest="pending_action", required=True)
@@ -1654,6 +1753,8 @@ def main():
     p_mext.add_argument("--review", action="store_true",
                         help="审核模式：对每条候选召回相似旧记忆，让 LLM 判断 add/duplicate/update/conflict/ignore，"
                              "只给建议并存入待审清单，不直接入库（用 memory pending apply/reject 处理）")
+    p_mext.add_argument("--no-fallback", action="store_true", dest="no_fallback",
+                        help="--review 守门判断默认 flash、拿不准时 pro 复核；加这个关闭复核（只用 flash）")
     p_mext.set_defaults(func=cmd_memory_extract)
 
     p_eval = sub.add_parser("eval", help="跑问答测试集，输出 hit@k / MRR 检索指标")
