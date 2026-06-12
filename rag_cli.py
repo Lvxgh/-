@@ -796,6 +796,69 @@ def parse_extracted_memories(text: str) -> list[dict]:
     return out
 
 
+# ---------- 记忆生命周期：新记忆进库前先判断 新增/重复/更新/冲突/忽略 ----------
+#
+# 动机：extract 能自动提取记忆之后，如果全部直接写库，库会被慢慢污染——
+# 同一件事换个说法就重复一条、偏好变了却新旧并存互相打架。
+# 所以让 LLM 当"守门员"只给建议，真正改库的动作一律由人确认（pending apply）。
+
+JUDGE_PROMPT = (
+    "你是个人记忆库的守门员。给你一条「新记忆」，以及从库里按相似度召回的几条「已有记忆」，"
+    "判断新记忆该怎么处理，从五个动作里选一个：\n"
+    "- add：和已有记忆都不重叠，是独立的新信息，应该新增\n"
+    "- duplicate：和某条已有记忆说的是同一件事（换了说法、中英文混用也算），不必再写入\n"
+    "- update：是某条已有记忆的补充、细化或更准确的版本（方向一致，只是信息更多），建议更新那条旧记忆\n"
+    "- conflict：和某条已有记忆相互矛盾（比如偏好反转、事实对不上），不能自动处理，要人工确认\n"
+    "- ignore：琐事或临时状态（吃了什么、今天天气），没有长期记住的价值\n"
+    "注意：偏好发生变化时宁可报 conflict 也不要悄悄 update——改写用户偏好必须经人确认。\n"
+    "注意：只是话题相关、但讲的是不同方面的独立事实（如旧记忆讲项目是什么，新记忆讲项目用了什么工具），"
+    "选 add 而不是 update——一条记忆只说一件事，检索才精准。\n"
+    "只输出一个 JSON 对象，不要任何其他文字：\n"
+    '{"action": "add/duplicate/update/conflict/ignore 五选一", '
+    '"target_id": "涉及的那条已有记忆的 id（duplicate/update/conflict 必填，add/ignore 填 null）", '
+    '"merged_content": "update/conflict 时给出建议的更新后内容（一句完整陈述），其余填 null", '
+    '"reason": "一句话原因"}'
+)
+
+
+def judge_memory_action(new_memory: dict, candidates: list[dict],
+                        backend: str, model: str) -> dict:
+    """让 LLM 判断一条新记忆该怎么进库，返回 {"action", "target_id", "merged_content", "reason"}。
+
+    本函数只产出建议、绝不改库。为什么：改错一条偏好的代价远大于多确认一次，
+    所以 update/conflict 必须经 memory pending apply 由人执行。
+    解析失败或动作不认识时，宁可报 conflict 拦下来要人看，也不默认放行入库。
+    """
+    cand_text = "\n".join(
+        f"- id={m['id']} [{m['type']}，重要性 {m['importance']}] {m['content']}"
+        for m in candidates
+    ) or "（记忆库是空的，没有相似记忆）"
+    user_msg = (
+        f"新记忆：[{new_memory['type']}，重要性 {new_memory['importance']}] {new_memory['content']}\n\n"
+        f"已有记忆（按相似度召回）：\n{cand_text}"
+    )
+    reply = llm_complete(backend, model, JUDGE_PROMPT, user_msg)
+    # 宽容解析：取回复里第一个 { 到最后一个 } 之间的部分（容忍 ```json 围栏等装饰）
+    start, end = reply.find("{"), reply.rfind("}")
+    try:
+        obj = json.loads(reply[start:end + 1]) if start != -1 else {}
+    except json.JSONDecodeError:
+        obj = {}
+    action = obj.get("action")
+    if action not in ("add", "duplicate", "update", "conflict", "ignore"):
+        return {"action": "conflict", "target_id": None, "merged_content": None,
+                "reason": f"LLM 输出无法解析（动作={action!r}），需要人工判断"}
+    target = obj.get("target_id")
+    if target not in {m["id"] for m in candidates}:
+        target = None  # LLM 偶尔会编一个不存在的 id，编的一律作废
+    reason = str(obj.get("reason") or "").strip() or "（LLM 没给原因）"
+    if action in ("duplicate", "update", "conflict") and target is None:
+        reason += "（注意：LLM 未给出有效 target_id）"
+    merged = obj.get("merged_content")
+    merged = str(merged).strip() if merged and str(merged).strip().lower() != "null" else None
+    return {"action": action, "target_id": target, "merged_content": merged, "reason": reason}
+
+
 def cmd_memory_extract(args):
     if args.text:
         text = args.text
@@ -816,6 +879,10 @@ def cmd_memory_extract(args):
     if not extracted:
         sys.exit("没有提取到任何记忆（模型输出格式不对，或文本里没有可提取的内容）")
 
+    if args.review:
+        review_candidates(extracted, backend, model)
+        return
+
     n_added = n_dup = 0
     for em in extracted:
         if args.dry_run:
@@ -831,6 +898,108 @@ def cmd_memory_extract(args):
             print(f"跳过重复（与 [{old['id']}] 相似度 {sim:.3f}）：{em['content']}")
     if not args.dry_run:
         print(f"提取完成：新增 {n_added} 条，跳过重复 {n_dup} 条")
+
+
+# ---------- 待审清单（pending）：extract --review 的候选存在这里，由人 apply / reject ----------
+#
+# 文件和记忆库放在一起（.memory_store/pending_memories.json，同样不进 Git），
+# 每条记录候选内容 + LLM 的建议动作，apply 才真正改库。
+
+PENDING_FILE = MEMORY_DIR / "pending_memories.json"
+
+
+def load_pending() -> list[dict]:
+    return json.loads(PENDING_FILE.read_text(encoding="utf-8")) if PENDING_FILE.exists() else []
+
+
+def save_pending(items: list[dict]):
+    MEMORY_DIR.mkdir(exist_ok=True)
+    PENDING_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def review_candidates(extracted: list[dict], backend: str, model: str):
+    """--review 模式：每条候选先召回 top5 相似旧记忆，让 LLM 判断动作。
+
+    只打印建议并存入待审清单，不写记忆库——这是 extract 的安全模式，
+    防止自动提取的内容（重复、偏好反转）不经确认就污染长期记忆。
+    """
+    memories, _ = load_memories()
+    pending = load_pending()
+    next_p = max((int(p["id"][1:]) for p in pending), default=0) + 1
+    for n, em in enumerate(extracted, 1):
+        candidates = recall_memories(em["content"], 5) if memories else []
+        verdict = judge_memory_action(em, candidates, backend, model)
+        item = {"id": f"p{next_p}", "candidate": em, **verdict,
+                "created_at": datetime.now().isoformat(timespec="seconds")}
+        pending.append(item)
+        next_p += 1
+        print(f"\n[候选 {n}]（待审 {item['id']}）")
+        print(f"content: {em['content']}")
+        print(f"type: {em['type']}    importance: {em['importance']}")
+        target = f"  target: {verdict['target_id']}" if verdict["target_id"] else ""
+        print(f"LLM 建议：{verdict['action']}{target}")
+        if verdict["merged_content"]:
+            print(f"merged_content: {verdict['merged_content']}")
+        print(f"reason: {verdict['reason']}")
+    save_pending(pending)
+    print(f"\n以上 {len(extracted)} 条候选都没有入库，已存入待审清单。"
+          f"用 memory pending list 查看，apply <id> 执行建议，reject <id> 丢弃。")
+
+
+def find_pending(pending_id: str) -> tuple[list[dict], int]:
+    pending = load_pending()
+    idx = next((i for i, p in enumerate(pending) if p["id"] == pending_id), None)
+    if idx is None:
+        sys.exit(f"错误：没有 id 为 {pending_id} 的待审项（用 memory pending list 查看）")
+    return pending, idx
+
+
+def cmd_memory_pending_list(args):
+    pending = load_pending()
+    if not pending:
+        sys.exit("待审清单是空的（memory extract ... --review 会往这里存候选）")
+    for p in pending:
+        c = p["candidate"]
+        target = f" → {p['target_id']}" if p.get("target_id") else ""
+        print(f"[{p['id']:>4}] 建议 {p['action']}{target}  （{c['type']}，重要性 {c['importance']}）{c['content']}")
+        print(f"       理由：{p['reason']}")
+        if p.get("merged_content"):
+            print(f"       合并稿：{p['merged_content']}")
+    print(f"共 {len(pending)} 条待审")
+
+
+def cmd_memory_pending_apply(args):
+    """执行 LLM 的建议动作（人工确认这一步就是现在）：
+    add → 入库（仍过 add_memory 的查重）；update/conflict → 把目标记忆更新成合并稿
+    （conflict 走到这里说明用户确认了偏好/事实确实变了）；duplicate/ignore → 按建议丢弃。
+    """
+    pending, idx = find_pending(args.pending_id)
+    item = pending[idx]
+    cand, action = item["candidate"], item["action"]
+    if action == "add":
+        ok, info = add_memory(cand["content"], cand["type"], cand["importance"], source="extracted")
+        if ok:
+            print(f"已新增 [{info['id']}]（{info['type']}，重要性 {info['importance']}，extracted）：{info['content']}")
+        else:
+            sim, old = info
+            print(f"查重拦截：与 [{old['id']}] 相似度 {sim:.3f}，未入库（库里已有等价记忆）")
+    elif action in ("update", "conflict"):
+        if not item.get("target_id"):
+            sys.exit("错误：该建议没有有效的 target_id，无法执行。可 reject 后手动 memory add / update")
+        new_content = item.get("merged_content") or cand["content"]
+        m = update_memory(item["target_id"], content=new_content)
+        print(f"已把 [{m['id']}] 更新为：{m['content']}")
+    else:  # duplicate / ignore：建议本身就是"不入库"
+        print(f"建议是 {action}（不入库），已按建议丢弃该候选")
+    pending.pop(idx)
+    save_pending(pending)
+
+
+def cmd_memory_pending_reject(args):
+    pending, idx = find_pending(args.pending_id)
+    gone = pending.pop(idx)
+    save_pending(pending)
+    print(f"已丢弃待审 [{gone['id']}]：{gone['candidate']['content']}")
 
 
 # 重要性加分系数。RRF 里相邻名次的分差约 0.00026，取 0.0001 让重要性只在
@@ -996,6 +1165,74 @@ def cmd_memory_forget(args):
     print(f"已遗忘 [{gone['id']}]：{gone['content']}")
 
 
+def update_memory(memory_id: str, content: str | None = None, mtype: str | None = None,
+                  importance: int | None = None, tags: list[str] | None = None) -> dict:
+    """部分更新一条记忆（memory update 和 pending apply 共用）。
+
+    只动这一条：content 变了就重算它那一行的 embedding，其余行原封不动，
+    行号对齐不变，所有记忆的 id 也不变。
+    """
+    memories, embeddings = load_memories()
+    idx = next((i for i, m in enumerate(memories) if m["id"] == memory_id), None)
+    if idx is None:
+        sys.exit(f"错误：没有 id 为 {memory_id} 的记忆（用 memory list 查看）")
+    m = memories[idx]
+    if content is not None and content != m["content"]:
+        m["content"] = content
+        embedder = load_embedder()
+        # 和 add_memory 一致：记忆内容是"文档"一侧，不加查询前缀
+        embeddings[idx] = embedder.encode([content], normalize_embeddings=True).astype(np.float32)[0]
+    if mtype is not None:
+        m["type"] = mtype
+    if importance is not None:
+        m["importance"] = importance
+    if tags is not None:
+        m["tags"] = tags
+    m["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_memories(memories, embeddings)
+    return m
+
+
+def cmd_memory_update(args):
+    tags = ([t.strip() for t in args.tags.split(",") if t.strip()]
+            if args.tags is not None else None)
+    if args.content is None and args.type is None and args.importance is None and tags is None:
+        sys.exit("错误：至少给一个要更新的字段（--content / --type / --importance / --tags）")
+    m = update_memory(args.memory_id, content=args.content, mtype=args.type,
+                      importance=args.importance, tags=tags)
+    tag_str = f"  #{','.join(m['tags'])}" if m["tags"] else ""
+    print(f"已更新 [{m['id']}]（{m['type']}，重要性 {m['importance']}）：{m['content']}{tag_str}")
+
+
+def cmd_memory_merge(args):
+    """手动合并两条记忆：第一个 id 保留并改成合并后的内容，第二个删除。
+
+    合并文案必须人工用 --content 给出——让 LLM 自动写合并稿是以后的事，
+    这一步先把"合并完库还对齐、元数据不丢"做对：tags 取并集、importance 取较高值。
+    """
+    memories, embeddings = load_memories()
+    pos = {m["id"]: i for i, m in enumerate(memories)}
+    if args.id1 == args.id2:
+        sys.exit("错误：两个 id 相同，没有可合并的")
+    for mid in (args.id1, args.id2):
+        if mid not in pos:
+            sys.exit(f"错误：没有 id 为 {mid} 的记忆（用 memory list 查看）")
+    keep, drop = memories[pos[args.id1]], memories[pos[args.id2]]
+    keep["content"] = args.content
+    keep["type"] = args.type or keep["type"]
+    keep["importance"] = max(keep["importance"], drop["importance"])
+    keep["tags"] = keep["tags"] + [t for t in drop["tags"] if t not in keep["tags"]]
+    keep["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    embedder = load_embedder()
+    # 先改写保留行的向量，再删另一行——np.delete 之后行号会前移，顺序不能反
+    embeddings[pos[args.id1]] = embedder.encode([args.content], normalize_embeddings=True).astype(np.float32)[0]
+    drop_idx = pos[args.id2]
+    memories.pop(drop_idx)
+    embeddings = np.delete(embeddings, drop_idx, axis=0)
+    save_memories(memories, embeddings)
+    print(f"已合并 [{drop['id']}] → [{keep['id']}]（{keep['type']}，重要性 {keep['importance']}）：{keep['content']}")
+
+
 def cmd_eval(args):
     """跑问答测试集，量化检索质量。
 
@@ -1120,6 +1357,28 @@ def main():
     p_mforget = mem_sub.add_parser("forget", help="按 id 删除一条记忆")
     p_mforget.add_argument("memory_id", help="记忆 id，如 m3（memory list 可查）")
     p_mforget.set_defaults(func=cmd_memory_forget)
+    p_mupd = mem_sub.add_parser("update", help="按 id 更新一条记忆的部分字段（content 变了会重算向量）")
+    p_mupd.add_argument("memory_id", help="记忆 id，如 m3（memory list 可查）")
+    p_mupd.add_argument("--content", default=None, help="新的记忆内容")
+    p_mupd.add_argument("--type", choices=MEMORY_TYPES, default=None, help="新类型，不填不改")
+    p_mupd.add_argument("--importance", type=int, choices=range(1, 6), default=None, help="新重要性 1-5，不填不改")
+    p_mupd.add_argument("--tags", default=None, help='逗号分隔的新标签（整体替换；--tags "" 可清空）')
+    p_mupd.set_defaults(func=cmd_memory_update)
+    p_mmerge = mem_sub.add_parser("merge", help="合并两条记忆：保留第一个 id，删除第二个")
+    p_mmerge.add_argument("id1", help="保留的记忆 id")
+    p_mmerge.add_argument("id2", help="被合并删除的记忆 id")
+    p_mmerge.add_argument("--content", required=True, help="合并后的记忆内容（手动给出）")
+    p_mmerge.add_argument("--type", choices=MEMORY_TYPES, default=None, help="不填保留第一条的类型")
+    p_mmerge.set_defaults(func=cmd_memory_merge)
+    p_mpend = mem_sub.add_parser("pending", help="待审清单：处理 extract --review 存下的候选")
+    pend_sub = p_mpend.add_subparsers(dest="pending_action", required=True)
+    pend_sub.add_parser("list", help="列出所有待审候选").set_defaults(func=cmd_memory_pending_list)
+    p_papply = pend_sub.add_parser("apply", help="执行 LLM 建议（add 入库 / update·conflict 更新目标 / duplicate·ignore 丢弃）")
+    p_papply.add_argument("pending_id", help="待审 id，如 p1")
+    p_papply.set_defaults(func=cmd_memory_pending_apply)
+    p_prej = pend_sub.add_parser("reject", help="丢弃一条待审候选，不改库")
+    p_prej.add_argument("pending_id", help="待审 id，如 p1")
+    p_prej.set_defaults(func=cmd_memory_pending_reject)
     p_meval = mem_sub.add_parser("eval", help="跑记忆召回评测集，输出 hit@1/3/5 / MRR")
     p_meval.add_argument("--dataset", default="eval/memory_eval.json",
                          help="评测集路径（默认 eval/memory_eval.json）")
@@ -1138,6 +1397,9 @@ def main():
     p_mext.add_argument("--model", default=None, help="模型名，不填按后端用默认值")
     p_mext.add_argument("--max-n", type=int, default=10, dest="max_n", help="最多提取几条（默认 10）")
     p_mext.add_argument("--dry-run", action="store_true", help="只预览提取结果，不入库")
+    p_mext.add_argument("--review", action="store_true",
+                        help="审核模式：对每条候选召回相似旧记忆，让 LLM 判断 add/duplicate/update/conflict/ignore，"
+                             "只给建议并存入待审清单，不直接入库（用 memory pending apply/reject 处理）")
     p_mext.set_defaults(func=cmd_memory_extract)
 
     p_eval = sub.add_parser("eval", help="跑问答测试集，输出 hit@k / MRR 检索指标")

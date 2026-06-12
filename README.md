@@ -54,6 +54,11 @@ python rag_cli.py memory list
 python rag_cli.py memory forget m2
 python rag_cli.py memory eval        # 跑记忆召回评测集；--rerank 对比重排效果
 python rag_cli.py memory extract 聊天记录.md --dry-run   # LLM 自动提取记忆（预览）；--backend 三选一同 ask
+python rag_cli.py memory update m3 --content "新内容"    # 部分更新（content/type/importance/tags 任选），自动重算向量
+python rag_cli.py memory merge m1 m4 --content "合并稿"  # 合并两条：保留 m1，删除 m4，tags 取并集、重要性取较高
+python rag_cli.py memory extract 聊天记录.md --review    # 安全模式：LLM 判断每条候选是 add/duplicate/update/conflict/ignore，
+                                                         # 只给建议存入待审清单，不直接入库
+python rag_cli.py memory pending list                    # 查看待审候选；apply <id> 执行建议；reject <id> 丢弃
 # ask 会自动注入 top3 相关记忆，让回答贴合你的偏好和背景（--no-memory 关闭）
 # 记忆存在 .memory_store/（个人数据，不进 Git）。评测前先按 eval/memory_eval.json
 # 的预期内容添加 demo 记忆（见仓库提交历史或 CLAUDE.md）
@@ -101,4 +106,5 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 - [x] **DeepSeek 后端**：`ask` / `memory extract` 支持 `--backend deepseek`（OpenAI 兼容接口，urllib 直连零依赖）；提取和记忆注入已端到端验证；`--backend` 不填自动按密钥可用性选后端
 - [x] **LLM 查询改写（HyDE）**：`memory recall/eval --rewrite`，LLM 把间接问法改写成"假想记忆"再检索。单开 hit@1 59.5%→**67.6%**（MRR 0.783）；与 rerank 叠加无增益（两者修的是同一批题）——便宜路径（不加载 1.1GB 重排模型）的好选择
 - [x] **记忆去重（阶段 2 第三步）**：`memory add` 自动查重，与已有记忆相似度 ≥0.92 时拒绝并提示，`--force` 可跳过
+- [x] **记忆生命周期最小闭环（阶段 2 第七步）**：`memory update`（部分字段更新+重算向量）、`memory merge`（手动合并两条）；`extract --review` 让 LLM 守门员判断每条候选该 add/duplicate/update/conflict/ignore，存入待审清单（`memory pending list/apply/reject`），LLM 只建议、改库必须人工确认。5 个场景测试（重复/偏好冲突/补充更新/琐事/独立新增）全部判对
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB
