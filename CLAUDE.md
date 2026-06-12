@@ -49,8 +49,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - [x] 评测集扩充到 37 题（偏好 12 / 事实 13 / 事件 12，含 2 题仅按类型判定）+ 29 条 demo 记忆；问法刻意同义/间接化防刷分。失败样本全是"间接问法与记忆原文无词面交集"型，是后续 rerank/查询改写的素材
 - [x] 召回超参网格实验：`MEMORY_RRF_K` 60→20。混合检索基线：hit@1 59.5% / hit@3 81.1% / hit@5 89.2% / MRR 0.699
 - [x] cross-encoder rerank 真正实现（`memory recall/eval --rerank`，复用 bge-reranker-base）：**hit@1 59.5%→75.7%，hit@3 91.9%，hit@5 94.6%，MRR 0.830**——5 个零词面交集失败题翻回 4 个
-- [x] LLM 自动记忆提取：`memory extract <文件>|--text`（`--dry-run` 预览、`--max-n` 限量），source 标记 extracted，逐条过查重；解析器容忍围栏/废话/坏行。**端到端待 API key 或 Ollama 就绪后验证**
-- [x] recall 接入 ask：ask 自动注入 top3 相关记忆（`<关于用户的记忆>` 块，`--no-memory` 关闭）；生成质量观察同样待 LLM 后端
+- [x] LLM 自动记忆提取：`memory extract <文件>|--text`（`--dry-run` 预览、`--max-n` 限量），source 标记 extracted，逐条过查重；解析器容忍围栏/废话/坏行。已用 DeepSeek 后端端到端验证：三类记忆分类正确、琐事正确丢弃
+- [x] recall 接入 ask：ask 自动注入 top3 相关记忆（`<关于用户的记忆>` 块，`--no-memory` 关闭）；DeepSeek 实测回答风格符合注入的"先结论、短答"偏好
+- [x] DeepSeek 后端：`--backend deepseek`（ask 和 memory extract 均可用），OpenAI 兼容接口用 urllib 直连零新依赖，默认 `deepseek-v4-pro`，密钥读环境变量 `DEEPSEEK_API_KEY`
 - [ ] 时间衰减：暂缓——当前 29 条记忆 created_at 全是同一天，衰减实验零信号；等记忆跨越足够时间再做
 - [ ] 记忆生命周期（其余）：相似记忆合并、冲突解决
 - [ ] **评估体系**（求职含金量最高）：跑 LoCoMo、LongMemEval 等公开 benchmark；自建回归测试，改记忆策略指标不许倒退；LLM-as-judge 评估记忆质量
@@ -82,6 +83,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python rag_cli.py index <笔记文件夹>         # 增量建索引（.md/.txt/.pdf），写入 .rag_index/
 python rag_cli.py search "<问题>" -k 5       # 混合检索，无需 API key；--rerank 开重排
 python rag_cli.py ask "<问题>"               # 检索+生成，需要 $env:ANTHROPIC_API_KEY
+python rag_cli.py ask "<问题>" --backend deepseek  # DeepSeek 云端，需要 $env:DEEPSEEK_API_KEY
 python rag_cli.py ask "<问题>" --backend ollama  # 本地模型，完全离线（需安装 Ollama）
 python rag_cli.py eval eval_questions.jsonl  # 跑问答测试集，输出 hit@k / MRR
 python rag_cli.py note add "<标题>" "<内容>"  # 增/改/删笔记后自动增量更新索引
@@ -97,12 +99,13 @@ python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget
 - 台式机上裸 `python` 指向 MSYS2 的 Python（无 pip）；建 venv 要用 `D:\python1\python.exe -m venv .venv`。
 - `.venv/` 和 `.rag_index/` 是机器本地产物，不应进版本控制或跨机同步；换机器后重建即可。
 - PowerShell 默认 GBK 编码，运行前先：`$env:PYTHONIOENCODING='utf-8'; [Console]::OutputEncoding = [Text.Encoding]::UTF8`。
+- 用户有 DeepSeek API key（密钥本身绝不写进仓库任何文件）；无 ANTHROPIC_API_KEY、未装 Ollama，所以 LLM 相关测试用 `--backend deepseek`。可用模型：`deepseek-v4-pro`（默认）、`deepseek-v4-flash`。
 
 ## 架构
 
 单文件 `rag_cli.py`（~190 行）实现完整 RAG 管线：
 
-`read_document`（`.pdf` 用 pypdf 抽文本，其余按 UTF-8 读）→ `chunk_markdown`（`.md` 按标题层级切小节，块前缀「【标题路径】」；其余走 `chunk_text` 固定切块；超长小节滑窗细分）→ `cmd_index`（bge 向量化，存 `.rag_index/chunks.json` + `embeddings.npy` + `files.json` 文件指纹）→ `retrieve`（混合检索：向量余弦 + 手写 BM25 两路，RRF 融合，每路取前 50；`--rerank` 时对前 20 个候选用 cross-encoder `bge-reranker-base` 重排）→ `cmd_ask`（片段注入 prompt，`--backend claude` 流式调 Claude API（默认 `claude-opus-4-8`）或 `--backend ollama` 走本地 http://localhost:11434）。
+`read_document`（`.pdf` 用 pypdf 抽文本，其余按 UTF-8 读）→ `chunk_markdown`（`.md` 按标题层级切小节，块前缀「【标题路径】」；其余走 `chunk_text` 固定切块；超长小节滑窗细分）→ `cmd_index`（bge 向量化，存 `.rag_index/chunks.json` + `embeddings.npy` + `files.json` 文件指纹）→ `retrieve`（混合检索：向量余弦 + 手写 BM25 两路，RRF 融合，每路取前 50；`--rerank` 时对前 20 个候选用 cross-encoder `bge-reranker-base` 重排）→ `cmd_ask`（片段注入 prompt，`--backend claude` 流式调 Claude API（默认 `claude-opus-4-8`）、`--backend deepseek` 走 DeepSeek 云端（OpenAI 兼容 SSE 流，urllib 直连）或 `--backend ollama` 走本地 http://localhost:11434）。
 
 混合检索的约定：BM25 的中文分词是单字+双字滑窗（`tokenize`），BM25 索引在查询时现建（个人笔记量级下足够快）；RRF 只融合排名不融合分数，BM25 零分的块不参与融合。
 
