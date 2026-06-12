@@ -56,7 +56,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - [x] LLM 查询改写（HyDE，`memory recall/eval --rewrite`）：`rewrite_query()` 让 LLM 把问题改写成"假想记忆"（猜答案的陈述句），召回时多融合两路（假想记忆的向量+BM25）。四配置对比（37 题）：基线 59.5%/0.699 → +rewrite **67.6%/0.783** → +rerank 75.7%/0.830 → 两者叠加 75.7%/0.829（无增益，修的是同一批间接问法题；rerank 用原问题打分，会把 rewrite 捞回的 #34 再次挤出）。结论：有 API 无 GPU/不想加载 1.1GB 重排模型时用 rewrite，否则 rerank 仍是最优单项。提示词调教记录：第一版"多带术语"→编造 MoSCoW/RICE；第二版"别编专有名词"→退化成复述问题；第三版"猜答案+示例"才对——HyDE 的灵魂是猜答案不是改问法
 - [ ] 时间衰减：暂缓——当前 29 条记忆 created_at 全是同一天，衰减实验零信号；等记忆跨越足够时间再做
 - [x] 全库记忆体检 `memory consolidate`（2026-06-12）：`find_similar_pairs()` 用现成 embeddings 矩阵乘两两算相似度（阈值默认 0.82、同 type 对优先、上限 `--max-pairs 20` 控制 LLM 调用数），`judge_memory_pair()` 逐对判断 keep/duplicate/merge/conflict（解析失败保守 keep——和 extract 守门员的保守 conflict 相反，因为体检对象是已入库旧记忆，错动比漏检代价大）。默认 dry-run；`--save-pending` 把 keep 之外的建议存待审清单（`kind: "consolidate"`、`target_ids` 两条），pending apply：merge→`merge_memories()`（从 cmd_memory_merge 抽出的共用底层）、duplicate→保留前者遗忘后者、conflict→拒绝执行强制人工。4 类场景全判对；提示词教训同 extract：要明说"同主题下不同事实选 keep 不要硬合并"（没这句时把"项目是什么"和"未来接 MCP"合成了一坨）。真实库 0.82 下 0 对（干净），0.7 下 LLM 对"方法+指标"类相关对仍偏爱 merge——所以默认阈值保守、改库必须人工确认
-- [ ] 记忆生命周期（其余）：merge 合并文案自动化（LLM 起草、人确认）、conflict 的交互式确认体验
+- [x] 生命周期判断评测 `memory lifecycle-eval`（2026-06-12）：30 题静态评测集 `eval/memory_lifecycle_eval.json`（action 任务 15 题：add/duplicate/update/conflict/ignore 各 3；pair 任务 15 题：keep 4/duplicate 3/merge 4/conflict 4），直接复用 `judge_memory_action`/`judge_memory_pair`，完全不碰 .memory_store。守门函数解析失败返回的保守动作在评测里一律记失败（碰巧对也不算），原始输出打印前 300 字。结果：**v4-pro 28/30=93.3%，v4-flash 28/30=93.3%**，错的是同两道题且都在 merge/keep 边界（"方法 vs 指标"被判 merge、"代码风格两侧面"被判 keep）——这条边界本身模糊，靠人工确认兜底，不再调提示词追分。结论：守门场景 flash 完全够用，可作降本默认
+- [ ] 记忆生命周期（其余）：merge 合并文案自动化（LLM 起草、人确认）、conflict 的交互式确认体验、review/consolidate 默认模型切到 v4-flash 降本（评测已证明同分）
 - [ ] **评估体系**（求职含金量最高）：跑 LoCoMo、LongMemEval 等公开 benchmark；自建回归测试，改记忆策略指标不许倒退；LLM-as-judge 评估记忆质量
 - **里程碑**：至少一个公开 benchmark 上有可对比成绩，写技术博客分析结果
 
@@ -96,6 +97,7 @@ python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget
 python rag_cli.py memory update m3 --content "<新内容>"   # 部分更新；merge <id1> <id2> --content 合并两条
 python rag_cli.py memory extract <文件> --review  # LLM 守门建议（不入库），memory pending list/apply/reject 处理
 python rag_cli.py memory consolidate              # 全库体检（dry-run）；--threshold 0.82 / --save-pending 存待审
+python rag_cli.py memory lifecycle-eval           # 守门判断准确率评测（静态集，不碰库）；--model 对比 pro/flash
 ```
 
 没有测试和 lint 配置（阶段 0 刻意从简）。
@@ -124,6 +126,8 @@ python rag_cli.py memory consolidate              # 全库体检（dry-run）；
 记忆提取（`cmd_memory_extract`）：`llm_complete()` 非流式调 LLM（claude/ollama），`EXTRACT_PROMPT` 要求每行一个 JSON（注意拼提示词用 `.replace` 不能 `.format`，JSON 示例的大括号会撞占位符），`parse_extracted_memories()` 宽容解析（跳坏行、type 不合法归 semantic、importance 夹到 1-5），逐条走 `add_memory(source="extracted")` 过查重。`add_memory()` 是 add/extract 共用底层，成功返回 (True, 新记忆)，重复返回 (False, (相似度, 已有记忆))。
 
 记忆生命周期（守门员模式）：`judge_memory_action()` 把新记忆和召回的 top5 相似记忆给 LLM，返回 `{"action", "target_id", "merged_content", "reason"}`（`JUDGE_PROMPT` 五动作 add/duplicate/update/conflict/ignore；LLM 编的 target_id 一律作废；解析失败保守返回 conflict 拦下来要人看）。`extract --review` 不写记忆库，建议存 `.memory_store/pending_memories.json`（id 取 p1、p2…），`memory pending apply` 才真正执行：add 走 `add_memory()`（仍过查重）、update/conflict 走 `update_memory()`（与 memory update 命令共用底层，content 变了只重算该行 embedding，行号对齐和所有 id 都不变）、duplicate/ignore 直接丢弃。核心原则：**LLM 只建议，任何改库动作必须人工 apply**。`memory merge` 是手动版（--content 必填），合并文案自动化留给后续。
+
+守门判断评测（`cmd_memory_lifecycle_eval`）：读 `eval/memory_lifecycle_eval.json`（JSON 数组，`task` 字段区分 action/pair 两类样本，静态给出 new_memory+existing_candidates 或 memory_a/b 和 expected_action），逐题调对应 judge 函数比对动作，输出总准确率、分任务、分动作和失败样本（含 LLM 理由）。注意：judge 函数解析失败时返回保守动作（action→conflict、pair→keep），评测靠 reason 里的"无法解析"识别并一律记失败。改守门提示词或换模型前后必跑。
 
 全库体检（`cmd_memory_consolidate`）：`find_similar_pairs()` 拿现成 embeddings 矩阵乘出全对相似度，≥阈值（默认 0.82）的对按"同 type 优先、组内相似度降序"排序、截到 `--max-pairs`；`judge_memory_pair()` 逐对给 LLM 判 keep/duplicate/merge/conflict（解析失败保守 keep 并打印原始输出）。默认 dry-run；`--save-pending` 存的待审条目带 `kind: "consolidate"` 和 `target_ids`（pending 的 list/apply/reject 都按 kind 分支——extract 条目没有 kind 字段）。apply 语义：merge→`merge_memories()`、duplicate→保留 target_ids[0] 删 [1]、conflict→sys.exit 拒绝（人工 update/forget 后 reject 清单）。两个守门提示词的共同教训：必须明说"一条记忆只说一件事，同主题不同事实选 keep/add"，否则 LLM 偏爱把相关事实合成一坨。
 

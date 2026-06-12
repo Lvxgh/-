@@ -846,6 +846,7 @@ def judge_memory_action(new_memory: dict, candidates: list[dict],
         obj = {}
     action = obj.get("action")
     if action not in ("add", "duplicate", "update", "conflict", "ignore"):
+        print(f"[警告：LLM 输出无法解析。原始输出：{reply[:300]}]", file=sys.stderr)
         return {"action": "conflict", "target_id": None, "merged_content": None,
                 "reason": f"LLM 输出无法解析（动作={action!r}），需要人工判断"}
     target = obj.get("target_id")
@@ -901,7 +902,7 @@ def judge_memory_pair(mem_a: dict, mem_b: dict, backend: str, model: str) -> dic
         obj = {}
     action = obj.get("action")
     if action not in ("keep", "duplicate", "merge", "conflict"):
-        print(f"[警告：LLM 输出无法解析，按 keep 处理。原始输出：{reply[:200]}]", file=sys.stderr)
+        print(f"[警告：LLM 输出无法解析，按 keep 处理。原始输出：{reply[:300]}]", file=sys.stderr)
         return {"action": "keep", "merged_content": None, "reason": "LLM 输出无法解析，保守不动"}
     merged = obj.get("merged_content")
     merged = str(merged).strip() if merged and str(merged).strip().lower() != "null" else None
@@ -982,6 +983,62 @@ def cmd_memory_consolidate(args):
         next_p += 1
     save_pending(pending)
     print(f"已存入待审清单（memory pending list 查看，apply 执行，reject 丢弃）。")
+
+
+def cmd_memory_lifecycle_eval(args):
+    """评测两个 LLM 守门判断的准确率：judge_memory_action（新记忆进库的五动作）
+    和 judge_memory_pair（全库体检的四动作）。
+
+    和 memory eval 同一套方法论：改守门提示词、换模型、降成本之前后各跑一遍，
+    量化对比而不是凭手感。评测集全是静态数据，完全不读不写 .memory_store/。
+    """
+    path = Path(args.dataset)
+    if not path.exists():
+        sys.exit(f"错误：找不到评测集 {path}")
+    cases = json.loads(path.read_text(encoding="utf-8"))
+    if not cases:
+        sys.exit(f"错误：{path} 是空的")
+
+    backend = pick_backend(args.backend)
+    model = args.model or default_model(backend)
+    print(f"记忆生命周期判断评测：{path} | {backend}/{model} | 共 {len(cases)} 题")
+
+    task_stats = defaultdict(lambda: [0, 0])    # task -> [对, 总]
+    action_stats = defaultdict(lambda: [0, 0])  # 期望动作 -> [对, 总]
+    failures = []
+    for n, case in enumerate(cases, 1):
+        if case["task"] == "action":
+            verdict = judge_memory_action(case["new_memory"], case["existing_candidates"],
+                                          backend, model)
+        else:
+            verdict = judge_memory_pair(case["memory_a"], case["memory_b"], backend, model)
+        expected, got = case["expected_action"], verdict["action"]
+        # 解析失败时守门函数会返回保守动作（conflict/keep），就算碰巧等于期望也算失败——
+        # 那是兜底救的，不是模型判断对的
+        parse_failed = "无法解析" in verdict["reason"]
+        ok = got == expected and not parse_failed
+        task_stats[case["task"]][0] += ok
+        task_stats[case["task"]][1] += 1
+        action_stats[expected][0] += ok
+        action_stats[expected][1] += 1
+        mark = "✓" if ok else "✗"
+        print(f"[{n:>2}] {mark} {case['task']:<6} 期望 {expected:<9} 得到 {got:<9} {case['name']}")
+        if not ok:
+            failures.append((n, case, got, verdict["reason"]))
+
+    total = len(cases)
+    n_ok = sum(s[0] for s in task_stats.values())
+    print("-" * 60)
+    print(f"总准确率：{n_ok}/{total} = {n_ok / total:.1%}")
+    print("分任务：" + "  ".join(
+        f"{t} {s[0]}/{s[1]} = {s[0] / s[1]:.1%}" for t, s in sorted(task_stats.items())))
+    print("分动作：" + "  ".join(
+        f"{a} {s[0]}/{s[1]}" for a, s in sorted(action_stats.items())))
+    if failures:
+        print("\n失败样本：")
+        for n, case, got, reason in failures:
+            print(f"[{n}] {case['task']} / {case['name']}")
+            print(f"    期望 {case['expected_action']}，得到 {got}；LLM 理由：{reason}")
 
 
 def cmd_memory_extract(args):
@@ -1558,6 +1615,15 @@ def main():
                          help="不填则自动检测（同 ask）")
     p_mcons.add_argument("--model", default=None, help="模型名，不填按后端用默认值")
     p_mcons.set_defaults(func=cmd_memory_consolidate)
+    p_mlce = mem_sub.add_parser("lifecycle-eval",
+                                help="评测 LLM 守门判断准确率（extract 的五动作 + consolidate 的四动作），静态评测集不碰记忆库")
+    p_mlce.add_argument("--dataset", default="eval/memory_lifecycle_eval.json",
+                        help="评测集路径（默认 eval/memory_lifecycle_eval.json）")
+    p_mlce.add_argument("--backend", choices=["claude", "deepseek", "ollama"], default=None,
+                        help="不填则自动检测（同 ask）")
+    p_mlce.add_argument("--model", default=None,
+                        help="模型名，不填按后端用默认值（可用来对比 deepseek-v4-pro 和 deepseek-v4-flash）")
+    p_mlce.set_defaults(func=cmd_memory_lifecycle_eval)
     p_mpend = mem_sub.add_parser("pending", help="待审清单：处理 extract --review / consolidate --save-pending 存下的候选")
     pend_sub = p_mpend.add_subparsers(dest="pending_action", required=True)
     pend_sub.add_parser("list", help="列出所有待审候选").set_defaults(func=cmd_memory_pending_list)

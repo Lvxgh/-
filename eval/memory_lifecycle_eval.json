@@ -1,0 +1,246 @@
+[
+ {
+  "task": "action",
+  "name": "独立新事实：项目用什么 LLM 后端（话题相关但不同方面，不该并进项目记忆）",
+  "new_memory": {"content": "用户正在用 DeepSeek v4-pro 作为当前项目的主要 LLM 后端。", "type": "semantic", "importance": 3},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户正在做本地优先个人 AI 记忆系统项目。", "type": "semantic", "importance": 5},
+   {"id": "m2", "content": "用户喜欢先结论、短答、不要太啰嗦。", "type": "preference", "importance": 5}
+  ],
+  "expected_action": "add"
+ },
+ {
+  "task": "action",
+  "name": "独立新偏好：完全不同生活领域",
+  "new_memory": {"content": "用户周末喜欢打篮球放松。", "type": "preference", "importance": 2},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户希望代码保持可读性和教学性。", "type": "preference", "importance": 4},
+   {"id": "m2", "content": "用户正在做本地优先个人 AI 记忆系统项目。", "type": "semantic", "importance": 5}
+  ],
+  "expected_action": "add"
+ },
+ {
+  "task": "action",
+  "name": "独立新事实：笔记存放位置",
+  "new_memory": {"content": "用户的笔记主要存在 Obsidian 仓库里。", "type": "semantic", "importance": 3},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户正在做本地优先个人 AI 记忆系统项目。", "type": "semantic", "importance": 5}
+  ],
+  "expected_action": "add"
+ },
+ {
+  "task": "action",
+  "name": "中英文同义重复：local-first 项目",
+  "new_memory": {"content": "用户在开发一个 local-first 的 AI memory system。", "type": "semantic", "importance": 4},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户正在做本地优先个人 AI 记忆系统项目。", "type": "semantic", "importance": 5},
+   {"id": "m2", "content": "项目未来希望接入 MCP。", "type": "semantic", "importance": 4}
+  ],
+  "expected_action": "duplicate"
+ },
+ {
+  "task": "action",
+  "name": "换说法的重复：回答风格偏好",
+  "new_memory": {"content": "用户回答问题时喜欢直接给结论，废话越少越好。", "type": "preference", "importance": 4},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户喜欢先结论、短答、不要太啰嗦。", "type": "preference", "importance": 5}
+  ],
+  "expected_action": "duplicate"
+ },
+ {
+  "task": "action",
+  "name": "语序重排的重复：评测集规模",
+  "new_memory": {"content": "项目的记忆评测集一共有 37 道题。", "type": "semantic", "importance": 3},
+  "existing_candidates": [
+   {"id": "m1", "content": "记忆评测集扩充到了 37 题，覆盖三类记忆。", "type": "semantic", "importance": 3},
+   {"id": "m2", "content": "记忆召回用向量加 BM25 两路混合检索。", "type": "semantic", "importance": 3}
+  ],
+  "expected_action": "duplicate"
+ },
+ {
+  "task": "action",
+  "name": "同向细化：代码风格补充具体要求",
+  "new_memory": {"content": "用户希望代码有中文注释，并且不要过度抽象。", "type": "preference", "importance": 3},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户希望代码保持可读性和教学性。", "type": "preference", "importance": 4}
+  ],
+  "expected_action": "update"
+ },
+ {
+  "task": "action",
+  "name": "更精确的版本：投入时间从模糊到具体",
+  "new_memory": {"content": "用户每周能投入 25 小时以上做这个项目。", "type": "semantic", "importance": 3},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户有比较多的业余时间投入项目。", "type": "semantic", "importance": 3}
+  ],
+  "expected_action": "update"
+ },
+ {
+  "task": "action",
+  "name": "补充细节：embedding 模型从系列到具体型号",
+  "new_memory": {"content": "项目用 bge-small-zh-v1.5 做 embedding，选它是因为中文优先且能本地跑。", "type": "semantic", "importance": 3},
+  "existing_candidates": [
+   {"id": "m1", "content": "项目用 bge 系列模型做 embedding。", "type": "semantic", "importance": 3}
+  ],
+  "expected_action": "update"
+ },
+ {
+  "task": "action",
+  "name": "偏好反转：短答变详细",
+  "new_memory": {"content": "用户现在希望回答问题时解释更详细一点，不要太短。", "type": "preference", "importance": 4},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户喜欢先结论、短答、不要太啰嗦。", "type": "preference", "importance": 5}
+  ],
+  "expected_action": "conflict"
+ },
+ {
+  "task": "action",
+  "name": "事实冲突：要不要数据库",
+  "new_memory": {"content": "项目决定改用 PostgreSQL 来存记忆。", "type": "semantic", "importance": 4},
+  "existing_candidates": [
+   {"id": "m1", "content": "项目刻意不引入数据库，记忆存 JSON 文件加 numpy 向量。", "type": "semantic", "importance": 4}
+  ],
+  "expected_action": "conflict"
+ },
+ {
+  "task": "action",
+  "name": "偏好反转：注释语言中文变英文",
+  "new_memory": {"content": "用户觉得英文注释更专业，以后代码注释都用英文。", "type": "preference", "importance": 3},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户希望代码里写中文注释。", "type": "preference", "importance": 4}
+  ],
+  "expected_action": "conflict"
+ },
+ {
+  "task": "action",
+  "name": "琐事：今天吃了什么",
+  "new_memory": {"content": "用户今天中午吃了鸡腿饭。", "type": "episodic", "importance": 1},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户正在做本地优先个人 AI 记忆系统项目。", "type": "semantic", "importance": 5}
+  ],
+  "expected_action": "ignore"
+ },
+ {
+  "task": "action",
+  "name": "临时状态：今天有点困",
+  "new_memory": {"content": "用户说今天有点困，想早点睡。", "type": "episodic", "importance": 1},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户喜欢先结论、短答、不要太啰嗦。", "type": "preference", "importance": 5}
+  ],
+  "expected_action": "ignore"
+ },
+ {
+  "task": "action",
+  "name": "过程性细节：重开了一次终端",
+  "new_memory": {"content": "用户刚才把终端窗口关掉重开了一次。", "type": "episodic", "importance": 1},
+  "existing_candidates": [
+   {"id": "m1", "content": "用户的开发环境是 Windows 11 加 PowerShell。", "type": "semantic", "importance": 3}
+  ],
+  "expected_action": "ignore"
+ },
+ {
+  "task": "pair",
+  "name": "同一项目下不同事实：项目是什么 vs 未来接 MCP",
+  "memory_a": {"id": "m1", "content": "用户正在做本地优先个人 AI 记忆系统项目。", "type": "semantic", "importance": 5},
+  "memory_b": {"id": "m2", "content": "项目未来希望接入 MCP。", "type": "semantic", "importance": 4},
+  "expected_action": "keep"
+ },
+ {
+  "task": "pair",
+  "name": "不同领域的偏好：代码风格 vs 回答风格",
+  "memory_a": {"id": "m1", "content": "用户希望代码有中文注释，不要过度抽象。", "type": "preference", "importance": 3},
+  "memory_b": {"id": "m2", "content": "用户喜欢先结论、短答、不要太啰嗦。", "type": "preference", "importance": 5},
+  "expected_action": "keep"
+ },
+ {
+  "task": "pair",
+  "name": "同一系统的不同事实：记忆分类 vs 存储位置",
+  "memory_a": {"id": "m1", "content": "记忆分为 preference、semantic、episodic 三类。", "type": "semantic", "importance": 3},
+  "memory_b": {"id": "m2", "content": "记忆数据存在 .memory_store/ 目录，包含 memories.json 和 embeddings.npy。", "type": "semantic", "importance": 3},
+  "expected_action": "keep"
+ },
+ {
+  "task": "pair",
+  "name": "方法 vs 指标（高相似度但各说各事的难例）",
+  "memory_a": {"id": "m1", "content": "记忆召回用向量加 BM25 两路混合检索，RRF 融合排名。", "type": "semantic", "importance": 3},
+  "memory_b": {"id": "m2", "content": "记忆召回升级为混合检索后，hit@1 从 66.7% 提到 75%。", "type": "episodic", "importance": 3},
+  "expected_action": "keep"
+ },
+ {
+  "task": "pair",
+  "name": "中英文重复：local-first 项目",
+  "memory_a": {"id": "m1", "content": "用户正在做本地优先个人 AI 记忆系统项目。", "type": "semantic", "importance": 5},
+  "memory_b": {"id": "m2", "content": "用户在开发一个 local-first 的 AI memory system。", "type": "semantic", "importance": 4},
+  "expected_action": "duplicate"
+ },
+ {
+  "task": "pair",
+  "name": "换说法的重复：直接给结论",
+  "memory_a": {"id": "m1", "content": "用户喜欢先结论、短答、不要太啰嗦。", "type": "preference", "importance": 5},
+  "memory_b": {"id": "m2", "content": "用户希望回答直接给结论，不要绕弯子。", "type": "preference", "importance": 4},
+  "expected_action": "duplicate"
+ },
+ {
+  "task": "pair",
+  "name": "语序重排的重复：37 题评测集",
+  "memory_a": {"id": "m1", "content": "记忆评测集有 37 题，覆盖三类记忆。", "type": "semantic", "importance": 3},
+  "memory_b": {"id": "m2", "content": "三类记忆的评测题一共 37 道。", "type": "semantic", "importance": 3},
+  "expected_action": "duplicate"
+ },
+ {
+  "task": "pair",
+  "name": "同一偏好的两个侧面：代码风格",
+  "memory_a": {"id": "m1", "content": "用户希望代码保持可读性和教学性。", "type": "preference", "importance": 4},
+  "memory_b": {"id": "m2", "content": "用户希望代码有中文注释，不要过度抽象。", "type": "preference", "importance": 3},
+  "expected_action": "merge"
+ },
+ {
+  "task": "pair",
+  "name": "同一事物各漏细节：embedding 模型型号与属性",
+  "memory_a": {"id": "m1", "content": "项目的 embedding 模型是 bge-small-zh-v1.5。", "type": "semantic", "importance": 3},
+  "memory_b": {"id": "m2", "content": "项目的 embedding 模型约 100MB，可以本地运行。", "type": "semantic", "importance": 3},
+  "expected_action": "merge"
+ },
+ {
+  "task": "pair",
+  "name": "同一事实的概述与展开：记忆三分类",
+  "memory_a": {"id": "m1", "content": "记忆分为 preference、semantic、episodic 三类。", "type": "semantic", "importance": 3},
+  "memory_b": {"id": "m2", "content": "记忆分类里 preference 是偏好、semantic 是长期事实、episodic 是事件经历。", "type": "semantic", "importance": 3},
+  "expected_action": "merge"
+ },
+ {
+  "task": "pair",
+  "name": "同一情况的两半：母语与读英文文档",
+  "memory_a": {"id": "m1", "content": "用户的母语是中文。", "type": "semantic", "importance": 3},
+  "memory_b": {"id": "m2", "content": "用户是中文母语者，看英文技术文档比较吃力。", "type": "semantic", "importance": 3},
+  "expected_action": "merge"
+ },
+ {
+  "task": "pair",
+  "name": "偏好相反：短答 vs 详细",
+  "memory_a": {"id": "m1", "content": "用户喜欢先结论、短答、不要太啰嗦。", "type": "preference", "importance": 5},
+  "memory_b": {"id": "m2", "content": "用户希望回答问题时解释更详细一点，不要太短。", "type": "preference", "importance": 4},
+  "expected_action": "conflict"
+ },
+ {
+  "task": "pair",
+  "name": "事实对不上：向量存哪里",
+  "memory_a": {"id": "m1", "content": "项目用 numpy 文件存向量，刻意不引入数据库。", "type": "semantic", "importance": 4},
+  "memory_b": {"id": "m2", "content": "项目的记忆向量存在 SQLite 数据库里。", "type": "semantic", "importance": 3},
+  "expected_action": "conflict"
+ },
+ {
+  "task": "pair",
+  "name": "偏好相反：注释语言",
+  "memory_a": {"id": "m1", "content": "用户希望代码注释用中文写。", "type": "preference", "importance": 4},
+  "memory_b": {"id": "m2", "content": "用户要求代码注释一律用英文。", "type": "preference", "importance": 3},
+  "expected_action": "conflict"
+ },
+ {
+  "task": "pair",
+  "name": "时间计划对不上：阶段 3 什么时候做",
+  "memory_a": {"id": "m1", "content": "项目计划 2026 年底前完成阶段 3 的 MCP 服务化。", "type": "semantic", "importance": 3},
+  "memory_b": {"id": "m2", "content": "项目计划 2027 年年中才开始做阶段 3。", "type": "semantic", "importance": 3},
+  "expected_action": "conflict"
+ }
+]
