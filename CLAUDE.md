@@ -52,6 +52,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - [x] LLM 自动记忆提取：`memory extract <文件>|--text`（`--dry-run` 预览、`--max-n` 限量），source 标记 extracted，逐条过查重；解析器容忍围栏/废话/坏行。已用 DeepSeek 后端端到端验证：三类记忆分类正确、琐事正确丢弃
 - [x] recall 接入 ask：ask 自动注入 top3 相关记忆（`<关于用户的记忆>` 块，`--no-memory` 关闭）；DeepSeek 实测回答风格符合注入的"先结论、短答"偏好
 - [x] DeepSeek 后端：`--backend deepseek`（ask 和 memory extract 均可用），OpenAI 兼容接口用 urllib 直连零新依赖，默认 `deepseek-v4-pro`，密钥读环境变量 `DEEPSEEK_API_KEY`；`--backend` 不填时 `pick_backend()` 按密钥可用性自动选（claude→deepseek→ollama）
+- [x] v4-pro 质量评估（2026-06-12 实测）：三个 LLM 场景当前阶段全部够用——提取格式纪律强（每行一个 JSON 全照办，宽容解析器基本没派上用场，琐事正确丢弃）；ask 防编造行为正确（没有就直说）、风格跟随注入的偏好记忆；改写对提示词敏感但终版稳定。未测边界：整本 PDF 级长文提取、将来冲突解决/LLM-as-judge 需要的裁判型判断力。待办：用现有 memory eval 对比 `deepseek-v4-flash` 做改写够不够用（更快更省）
 - [x] LLM 查询改写（HyDE，`memory recall/eval --rewrite`）：`rewrite_query()` 让 LLM 把问题改写成"假想记忆"（猜答案的陈述句），召回时多融合两路（假想记忆的向量+BM25）。四配置对比（37 题）：基线 59.5%/0.699 → +rewrite **67.6%/0.783** → +rerank 75.7%/0.830 → 两者叠加 75.7%/0.829（无增益，修的是同一批间接问法题；rerank 用原问题打分，会把 rewrite 捞回的 #34 再次挤出）。结论：有 API 无 GPU/不想加载 1.1GB 重排模型时用 rewrite，否则 rerank 仍是最优单项。提示词调教记录：第一版"多带术语"→编造 MoSCoW/RICE；第二版"别编专有名词"→退化成复述问题；第三版"猜答案+示例"才对——HyDE 的灵魂是猜答案不是改问法
 - [ ] 时间衰减：暂缓——当前 29 条记忆 created_at 全是同一天，衰减实验零信号；等记忆跨越足够时间再做
 - [ ] 记忆生命周期（其余）：相似记忆合并、冲突解决
