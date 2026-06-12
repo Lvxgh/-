@@ -46,6 +46,17 @@ def default_model(backend: str) -> str:
     return {"claude": DEFAULT_MODEL, "ollama": DEFAULT_OLLAMA_MODEL,
             "deepseek": DEFAULT_DEEPSEEK_MODEL}[backend]
 
+
+def pick_backend(backend: str | None) -> str:
+    """--backend 未指定时自动挑一个可用的后端：看哪家的密钥已配置，都没有就回退本地 Ollama。"""
+    if backend:
+        return backend
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "claude"
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return "deepseek"
+    return "ollama"
+
 # 模型加载很慢（数秒），缓存到模块级变量——eval 连续跑几十个问题时只加载一次
 _EMBEDDER = None
 _RERANKER = None
@@ -431,14 +442,18 @@ def deepseek_request(model: str, system: str, user_msg: str, stream: bool):
             '  PowerShell 里执行：$env:DEEPSEEK_API_KEY = "sk-..."\n'
             "  密钥在 https://platform.deepseek.com 申请和管理。"
         )
-    payload = json.dumps({
+    body = {
         "model": model,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user_msg}],
         "stream": stream,
-    }).encode("utf-8")
+    }
+    if not stream:
+        # 非流式都是内部结构化用途（记忆提取、查询改写），温度 0 求稳定可复现；
+        # ask 的流式生成保持默认温度
+        body["temperature"] = 0
     return urllib.request.Request(
-        DEEPSEEK_URL, data=payload,
+        DEEPSEEK_URL, data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
     )
 
@@ -499,12 +514,13 @@ def cmd_ask(args):
     )
     user_msg = f"<笔记内容>\n{context}\n</笔记内容>{memory_block}\n\n问题：{args.question}"
 
-    model = args.model or default_model(args.backend)
+    backend = pick_backend(args.backend)
+    model = args.model or default_model(backend)
     mem_note = f"，注入 {len(mems)} 条记忆" if mems else ""
-    print(f"\n[检索到 {len(hits)} 个相关片段{mem_note}，{args.backend}/{model} 生成回答...]\n", file=sys.stderr)
-    if args.backend == "claude":
+    print(f"\n[检索到 {len(hits)} 个相关片段{mem_note}，{backend}/{model} 生成回答...]\n", file=sys.stderr)
+    if backend == "claude":
         ask_claude(model, system, user_msg)
-    elif args.backend == "deepseek":
+    elif backend == "deepseek":
         ask_deepseek(model, system, user_msg)
     else:
         ask_ollama(model, system, user_msg)
@@ -731,6 +747,28 @@ def llm_complete(backend: str, model: str, system: str, user_msg: str) -> str:
         )
 
 
+REWRITE_PROMPT = (
+    "你是检索查询改写器。用户的问题会拿去检索一个「个人记忆库」，"
+    "里面是一条条第三人称陈述的事实（如「用户偏好……」「项目阶段 1 做……」）。\n"
+    "请猜一条「能回答这个问题的记忆」长什么样（不知道真实答案没关系，给最常见的合理猜测）：\n"
+    "- 陈述句、第三人称（「用户……」「项目……」）；写答案本身，不是把问题换个说法\n"
+    "- 用朴素的日常说法，多铺几个近义表述；不要编造问题里没有的专有名词和数字\n"
+    "- 只输出这一句话，不要解释、不要引号\n"
+    "示例：问「写代码有什么风格要求？」→ 用户要求代码简洁清晰、注重可读性，不要过度封装抽象"
+)
+
+
+def rewrite_query(query: str, backend: str, model: str) -> str:
+    """把间接问法改写成「假想记忆」再去检索（HyDE 思路）。
+
+    动机：评测里的顽固失败题全是"问题与记忆原文零词面交集"型，向量和 BM25 都够不着。
+    让 LLM 先猜一条"答案大概长什么样"的陈述句，拿它的向量和关键词去搜，
+    词面和语义就都对上了。改写失败（输出为空）时退回原问题，不让检索挂掉。
+    """
+    text = llm_complete(backend, model, REWRITE_PROMPT, query).strip()
+    return (text.splitlines()[0].strip() or query) if text else query
+
+
 def parse_extracted_memories(text: str) -> list[dict]:
     """解析 LLM 输出的记忆列表：每行一个 JSON 对象。
 
@@ -769,10 +807,11 @@ def cmd_memory_extract(args):
     else:
         sys.exit("错误：请给出要提取的文件路径，或用 --text 直接给一段文本")
 
-    model = args.model or default_model(args.backend)
-    print(f"[{args.backend}/{model} 提取记忆中...]", file=sys.stderr)
+    backend = pick_backend(args.backend)
+    model = args.model or default_model(backend)
+    print(f"[{backend}/{model} 提取记忆中...]", file=sys.stderr)
     # 注意不能用 .format()——提示词里的 JSON 示例带大括号，会被当成占位符
-    reply = llm_complete(args.backend, model, EXTRACT_PROMPT.replace("{max_n}", str(args.max_n)), text)
+    reply = llm_complete(backend, model, EXTRACT_PROMPT.replace("{max_n}", str(args.max_n)), text)
     extracted = parse_extracted_memories(reply)[: args.max_n]
     if not extracted:
         sys.exit("没有提取到任何记忆（模型输出格式不对，或文本里没有可提取的内容）")
@@ -820,10 +859,13 @@ def rerank_with_cross_encoder(query: str, candidates: list[dict]) -> list[dict]:
     return sorted(candidates, key=lambda m: m["rerank"], reverse=True)
 
 
-def recall_memories(query: str, top_k: int, rerank: bool = False) -> list[dict]:
+def recall_memories(query: str, top_k: int, rerank: bool = False,
+                    hyde: str | None = None) -> list[dict]:
     """记忆召回核心：混合检索（向量 + BM25，RRF 融合）+ 重要性微调。
     recall 命令和 memory eval 共用，保证评测的就是线上真实在跑的那套逻辑。
     rerank=True 时再过一遍 cross-encoder（更准但更慢，需加载约 1.1GB 模型）。
+    hyde 是 LLM 把问题改写成的「假想记忆」（rewrite_query 生成）：
+    给了就多融合两路（假想记忆的向量 + BM25），不给则和原来完全一样。
 
     和笔记检索的 retrieve() 同一套思路，直接复用 BM25 类和 tokenize。
     改这里的任何打分逻辑，前后都要跑 memory eval 对比，指标不许回退。
@@ -832,17 +874,25 @@ def recall_memories(query: str, top_k: int, rerank: bool = False) -> list[dict]:
     if not memories:
         sys.exit("记忆库是空的，没有可召回的内容")
     embedder = load_embedder()
-    q = embedder.encode([QUERY_PREFIX + query], normalize_embeddings=True)[0]
-    sims = embeddings @ q
-    bm = BM25([tokenize(m["content"]) for m in memories]).scores(tokenize(query))
+    queries = [query] + ([hyde] if hyde else [])
+    qvecs = embedder.encode([QUERY_PREFIX + q for q in queries], normalize_embeddings=True)
+    bm25 = BM25([tokenize(m["content"]) for m in memories])
+    # sim/bm 始终取原问题的分数：展示给用户看的应该是"问题与记忆"的关系，不是假想记忆的
+    sims = embeddings @ qvecs[0]
+    bm = bm25.scores(tokenize(query))
 
+    # 每个查询各贡献两路排名（向量 + BM25），RRF 把所有路融合在一起
     rrf = np.zeros(len(memories), dtype=np.float32)
-    for r, i in enumerate(np.argsort(sims)[::-1]):
-        rrf[i] += 1 / (MEMORY_RRF_K + r + 1)
-    for r, i in enumerate(np.argsort(bm)[::-1]):
-        if bm[i] <= 0:  # 关键词完全不匹配的不参与
-            break
-        rrf[i] += 1 / (MEMORY_RRF_K + r + 1)
+    for qv in qvecs:
+        s = embeddings @ qv
+        for r, i in enumerate(np.argsort(s)[::-1]):
+            rrf[i] += 1 / (MEMORY_RRF_K + r + 1)
+    for q in queries:
+        b = bm25.scores(tokenize(q))
+        for r, i in enumerate(np.argsort(b)[::-1]):
+            if b[i] <= 0:  # 关键词完全不匹配的不参与
+                break
+            rrf[i] += 1 / (MEMORY_RRF_K + r + 1)
 
     importance = np.array([m["importance"] for m in memories], dtype=np.float32)
     finals = rrf + IMPORTANCE_COEF * importance
@@ -863,7 +913,12 @@ def recall_memories(query: str, top_k: int, rerank: bool = False) -> list[dict]:
 
 
 def cmd_memory_recall(args):
-    for rank, m in enumerate(recall_memories(args.query, args.top_k, rerank=args.rerank), 1):
+    hyde = None
+    if args.rewrite:
+        backend = pick_backend(args.backend)
+        hyde = rewrite_query(args.query, backend, args.model or default_model(backend))
+        print(f"[改写为假想记忆：{hyde}]", file=sys.stderr)
+    for rank, m in enumerate(recall_memories(args.query, args.top_k, rerank=args.rerank, hyde=hyde), 1):
         rr = f"rerank {m['rerank']:.3f} | " if "rerank" in m else ""
         print(
             f"[{rank}] {rr}RRF {m['final']:.4f}（向量 {m['sim']:.3f} | BM25 {m['bm25']:.2f}"
@@ -896,10 +951,16 @@ def cmd_memory_eval(args):
     if not cases:
         sys.exit(f"错误：{path} 是空的")
 
+    if args.rewrite:
+        backend = pick_backend(args.backend)
+        model = args.model or default_model(backend)
+        print(f"[查询改写：{backend}/{model}，每题先改写再召回]", file=sys.stderr)
+
     hit1 = hit3 = hit5 = 0
     mrr = 0.0
     for n, case in enumerate(cases, 1):
-        hits = recall_memories(case["query"], 5, rerank=args.rerank)
+        hyde = rewrite_query(case["query"], backend, model) if args.rewrite else None
+        hits = recall_memories(case["query"], 5, rerank=args.rerank, hyde=hyde)
         rank = next((r for r, m in enumerate(hits, 1) if memory_hit(m, case)), 0)
         if rank:
             mrr += 1 / rank
@@ -916,10 +977,11 @@ def cmd_memory_eval(args):
     n = len(cases)
     print("-" * 60)
     print(f"记忆评测：{path}，共 {n} 题")
+    extras = [name for name, on in [("rewrite", args.rewrite), ("rerank", args.rerank)] if on]
     print(
         f"hit@1 {hit1 / n:.1%} | hit@3 {hit3 / n:.1%}"
         f" | hit@5 {hit5 / n:.1%} | MRR {mrr / n:.3f}"
-        + ("（已开启 rerank）" if args.rerank else "")
+        + (f"（已开启 {' + '.join(extras)}）" if extras else "")
     )
 
 
@@ -1003,8 +1065,8 @@ def main():
     p_ask.add_argument("-k", "--top-k", type=int, default=5)
     p_ask.add_argument("--rerank", action="store_true", help="用 cross-encoder 对候选重排（更准但更慢）")
     p_ask.add_argument(
-        "--backend", choices=["claude", "deepseek", "ollama"], default="claude",
-        help="claude=云端 API（默认）；deepseek=云端 API（需 DEEPSEEK_API_KEY）；ollama=本地模型，完全离线",
+        "--backend", choices=["claude", "deepseek", "ollama"], default=None,
+        help="不填则自动检测：有 ANTHROPIC_API_KEY 用 claude，有 DEEPSEEK_API_KEY 用 deepseek，否则 ollama",
     )
     p_ask.add_argument("--model", default=None, help="模型名，不填则按后端用默认值")
     p_ask.add_argument("--no-memory", action="store_true", help="不注入个人记忆，只用笔记回答")
@@ -1049,6 +1111,11 @@ def main():
     p_mrecall.add_argument("query", help="要回忆什么")
     p_mrecall.add_argument("-k", "--top-k", type=int, default=5)
     p_mrecall.add_argument("--rerank", action="store_true", help="cross-encoder 重排（更准但更慢）")
+    p_mrecall.add_argument("--rewrite", action="store_true",
+                           help="先让 LLM 把问题改写成「假想记忆」再检索（HyDE，对间接问法最有效，需 LLM 后端）")
+    p_mrecall.add_argument("--backend", choices=["claude", "deepseek", "ollama"], default=None,
+                           help="--rewrite 用哪个 LLM，不填自动检测（同 ask）")
+    p_mrecall.add_argument("--model", default=None, help="--rewrite 用的模型名，不填按后端用默认值")
     p_mrecall.set_defaults(func=cmd_memory_recall)
     p_mforget = mem_sub.add_parser("forget", help="按 id 删除一条记忆")
     p_mforget.add_argument("memory_id", help="记忆 id，如 m3（memory list 可查）")
@@ -1057,12 +1124,17 @@ def main():
     p_meval.add_argument("--dataset", default="eval/memory_eval.json",
                          help="评测集路径（默认 eval/memory_eval.json）")
     p_meval.add_argument("--rerank", action="store_true", help="开启重排后评测，便于对比")
+    p_meval.add_argument("--rewrite", action="store_true",
+                         help="开启 LLM 查询改写后评测（每题一次 LLM 调用，慢且花钱，但可与 --rerank 叠加）")
+    p_meval.add_argument("--backend", choices=["claude", "deepseek", "ollama"], default=None,
+                         help="--rewrite 用哪个 LLM，不填自动检测（同 ask）")
+    p_meval.add_argument("--model", default=None, help="--rewrite 用的模型名，不填按后端用默认值")
     p_meval.set_defaults(func=cmd_memory_eval)
     p_mext = mem_sub.add_parser("extract", help="用 LLM 从文件/文本自动提取记忆（source=extracted）")
     p_mext.add_argument("source_file", nargs="?", default=None, help="要提取的文件（.md/.txt/.pdf）")
     p_mext.add_argument("--text", default=None, help="直接给一段文本（与文件二选一）")
-    p_mext.add_argument("--backend", choices=["claude", "deepseek", "ollama"], default="claude",
-                        help="claude=云端 API（默认）；deepseek=云端 API（需 DEEPSEEK_API_KEY）；ollama=本地模型")
+    p_mext.add_argument("--backend", choices=["claude", "deepseek", "ollama"], default=None,
+                        help="不填则自动检测（同 ask）")
     p_mext.add_argument("--model", default=None, help="模型名，不填按后端用默认值")
     p_mext.add_argument("--max-n", type=int, default=10, dest="max_n", help="最多提取几条（默认 10）")
     p_mext.add_argument("--dry-run", action="store_true", help="只预览提取结果，不入库")

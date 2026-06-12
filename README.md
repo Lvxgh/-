@@ -26,7 +26,8 @@ python rag_cli.py index sample_notes
 # 2. 纯检索：混合检索（向量+BM25），不需要 API key
 python rag_cli.py search "怎么创建虚拟环境"
 
-# 3a. 检索 + 让 Claude 基于笔记回答（需要先设置 API key）
+# 3a. 检索 + 让 LLM 基于笔记回答。--backend 不填会自动检测：
+#     有 ANTHROPIC_API_KEY 用 claude → 有 DEEPSEEK_API_KEY 用 deepseek → 否则 ollama
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
 python rag_cli.py ask "这个项目分几个阶段？"
 
@@ -48,6 +49,7 @@ python rag_cli.py memory add "用户喜欢先结论、短答。" --type preferen
 python rag_cli.py memory add "2026-06 完成阶段1评测。" --type episodic --importance 4
 python rag_cli.py memory recall "用户喜欢怎样的回答风格？" -k 3   # 混合检索 + 重要性微调
 python rag_cli.py memory recall "怎么防止重复？" --rerank          # cross-encoder 重排，更准但更慢
+python rag_cli.py memory recall "功能怎么排优先级？" --rewrite     # LLM 先把问题改写成"假想记忆"再检索（HyDE）
 python rag_cli.py memory list
 python rag_cli.py memory forget m2
 python rag_cli.py memory eval        # 跑记忆召回评测集；--rerank 对比重排效果
@@ -96,6 +98,7 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 - [x] **评测集扩厚（阶段 2 第四步）**：37 题 × 29 条记忆，同义/间接问法防刷分，失败样本输出 top5 详情
 - [x] **召回超参实验（阶段 2 第五步）**：网格实验选定 RRF K=20；混合检索基线 hit@1 59.5% / hit@3 81.1% / hit@5 89.2% / MRR 0.699
 - [x] **记忆 rerank + 提取 + ask 闭环（阶段 2 第六步）**：`--rerank` 真 cross-encoder（hit@1 59.5%→**75.7%**、MRR 0.830）；`memory extract` LLM 自动提取（source=extracted）；`ask` 自动注入 top3 记忆
-- [x] **DeepSeek 后端**：`ask` / `memory extract` 支持 `--backend deepseek`（OpenAI 兼容接口，urllib 直连零依赖）；提取和记忆注入已端到端验证
+- [x] **DeepSeek 后端**：`ask` / `memory extract` 支持 `--backend deepseek`（OpenAI 兼容接口，urllib 直连零依赖）；提取和记忆注入已端到端验证；`--backend` 不填自动按密钥可用性选后端
+- [x] **LLM 查询改写（HyDE）**：`memory recall/eval --rewrite`，LLM 把间接问法改写成"假想记忆"再检索。单开 hit@1 59.5%→**67.6%**（MRR 0.783）；与 rerank 叠加无增益（两者修的是同一批题）——便宜路径（不加载 1.1GB 重排模型）的好选择
 - [x] **记忆去重（阶段 2 第三步）**：`memory add` 自动查重，与已有记忆相似度 ≥0.92 时拒绝并提示，`--force` 可跳过
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB

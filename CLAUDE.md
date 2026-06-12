@@ -51,7 +51,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - [x] cross-encoder rerank 真正实现（`memory recall/eval --rerank`，复用 bge-reranker-base）：**hit@1 59.5%→75.7%，hit@3 91.9%，hit@5 94.6%，MRR 0.830**——5 个零词面交集失败题翻回 4 个
 - [x] LLM 自动记忆提取：`memory extract <文件>|--text`（`--dry-run` 预览、`--max-n` 限量），source 标记 extracted，逐条过查重；解析器容忍围栏/废话/坏行。已用 DeepSeek 后端端到端验证：三类记忆分类正确、琐事正确丢弃
 - [x] recall 接入 ask：ask 自动注入 top3 相关记忆（`<关于用户的记忆>` 块，`--no-memory` 关闭）；DeepSeek 实测回答风格符合注入的"先结论、短答"偏好
-- [x] DeepSeek 后端：`--backend deepseek`（ask 和 memory extract 均可用），OpenAI 兼容接口用 urllib 直连零新依赖，默认 `deepseek-v4-pro`，密钥读环境变量 `DEEPSEEK_API_KEY`
+- [x] DeepSeek 后端：`--backend deepseek`（ask 和 memory extract 均可用），OpenAI 兼容接口用 urllib 直连零新依赖，默认 `deepseek-v4-pro`，密钥读环境变量 `DEEPSEEK_API_KEY`；`--backend` 不填时 `pick_backend()` 按密钥可用性自动选（claude→deepseek→ollama）
+- [x] LLM 查询改写（HyDE，`memory recall/eval --rewrite`）：`rewrite_query()` 让 LLM 把问题改写成"假想记忆"（猜答案的陈述句），召回时多融合两路（假想记忆的向量+BM25）。四配置对比（37 题）：基线 59.5%/0.699 → +rewrite **67.6%/0.783** → +rerank 75.7%/0.830 → 两者叠加 75.7%/0.829（无增益，修的是同一批间接问法题；rerank 用原问题打分，会把 rewrite 捞回的 #34 再次挤出）。结论：有 API 无 GPU/不想加载 1.1GB 重排模型时用 rewrite，否则 rerank 仍是最优单项。提示词调教记录：第一版"多带术语"→编造 MoSCoW/RICE；第二版"别编专有名词"→退化成复述问题；第三版"猜答案+示例"才对——HyDE 的灵魂是猜答案不是改问法
 - [ ] 时间衰减：暂缓——当前 29 条记忆 created_at 全是同一天，衰减实验零信号；等记忆跨越足够时间再做
 - [ ] 记忆生命周期（其余）：相似记忆合并、冲突解决
 - [ ] **评估体系**（求职含金量最高）：跑 LoCoMo、LongMemEval 等公开 benchmark；自建回归测试，改记忆策略指标不许倒退；LLM-as-judge 评估记忆质量
@@ -89,7 +90,7 @@ python rag_cli.py eval eval_questions.jsonl  # 跑问答测试集，输出 hit@k
 python rag_cli.py note add "<标题>" "<内容>"  # 增/改/删笔记后自动增量更新索引
 python rag_cli.py note append "<标题>" "<内容>"  # 另有 delete / list / open
 python rag_cli.py memory add "<内容>" --type preference --importance 5  # 记住
-python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget <id>
+python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget <id>；--rerank 重排 / --rewrite LLM 改写
 ```
 
 没有测试和 lint 配置（阶段 0 刻意从简）。
@@ -113,7 +114,7 @@ python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget
 
 记忆系统（阶段 2，`cmd_memory_*`）：记忆存 `.memory_store/memories.json` + `embeddings.npy`，行号一一对应（同 RAG 索引约定，forget 时用 `np.delete` 同步删行）。每条记忆含 id（m1、m2…取最大号+1）/ content / type（preference/semantic/episodic）/ importance（1-5）/ created_at / updated_at / source（manual，将来有 extracted）/ tags。`.memory_store/` 是个人数据，已加入 .gitignore。
 
-记忆召回（`recall_memories`，recall 命令与 memory eval 共用）：混合检索——向量余弦 + BM25（复用 RAG 的 BM25 类和 tokenize）RRF 融合（`MEMORY_RRF_K=20`，独立于 RAG 的 K=60），再加 `IMPORTANCE_COEF=0.0001 × importance` 微调。两个超参都经过 37 题评测网格实验（K∈{20,60,100}×系数∈{0,0.0001,0.0003}）选定。`--rerank` 时取约 3 倍候选池（`pool = max(top_k*3, 15)`）过 `rerank_with_cross_encoder()`（真实现，bge-reranker-base 逐对打分、按分数降序）再裁回 top_k；不开启则直接取 top_k。超参实验已穷尽：K∈{10,20,40,60,100}、系数∈{0,0.0001,0.0003,0.03} 共 9 组，hit@1 始终 59.5%（系数 0.03 会崩到 29.7%——重要性碾压相关性的量化反例）；rerank 一举把 hit@1 提到 75.7%，验证了"零词面交集失败只能靠 cross-encoder"的判断。
+记忆召回（`recall_memories`，recall 命令与 memory eval 共用）：混合检索——向量余弦 + BM25（复用 RAG 的 BM25 类和 tokenize）RRF 融合（`MEMORY_RRF_K=20`，独立于 RAG 的 K=60），再加 `IMPORTANCE_COEF=0.0001 × importance` 微调。两个超参都经过 37 题评测网格实验（K∈{20,60,100}×系数∈{0,0.0001,0.0003}）选定。`--rerank` 时取约 3 倍候选池（`pool = max(top_k*3, 15)`）过 `rerank_with_cross_encoder()`（真实现，bge-reranker-base 逐对打分、按分数降序）再裁回 top_k；不开启则直接取 top_k。超参实验已穷尽：K∈{10,20,40,60,100}、系数∈{0,0.0001,0.0003,0.03} 共 9 组，hit@1 始终 59.5%（系数 0.03 会崩到 29.7%——重要性碾压相关性的量化反例）；rerank 一举把 hit@1 提到 75.7%，验证了"零词面交集失败只能靠 cross-encoder"的判断。`--rewrite`（HyDE）时 `recall_memories` 收 `hyde` 参数，原问题+假想记忆各贡献向量/BM25 两路、共 4 路 RRF；展示用的 sim/bm25 分数始终取原问题的；rerank 的 cross-encoder 也始终用原问题打分。
 
 记忆提取（`cmd_memory_extract`）：`llm_complete()` 非流式调 LLM（claude/ollama），`EXTRACT_PROMPT` 要求每行一个 JSON（注意拼提示词用 `.replace` 不能 `.format`，JSON 示例的大括号会撞占位符），`parse_extracted_memories()` 宽容解析（跳坏行、type 不合法归 semantic、importance 夹到 1-5），逐条走 `add_memory(source="extracted")` 过查重。`add_memory()` 是 add/extract 共用底层，成功返回 (True, 新记忆)，重复返回 (False, (相似度, 已有记忆))。
 
