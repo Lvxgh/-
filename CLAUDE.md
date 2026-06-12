@@ -50,6 +50,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - [x] 召回超参网格实验：`MEMORY_RRF_K` 60→20。混合检索基线：hit@1 59.5% / hit@3 81.1% / hit@5 89.2% / MRR 0.699
 - [x] cross-encoder rerank 真正实现（`memory recall/eval --rerank`，复用 bge-reranker-base）：**hit@1 59.5%→75.7%，hit@3 91.9%，hit@5 94.6%，MRR 0.830**——5 个零词面交集失败题翻回 4 个
 - [x] LLM 自动记忆提取：`memory extract <文件>|--text`（`--dry-run` 预览、`--max-n` 限量），source 标记 extracted，逐条过查重；解析器容忍围栏/废话/坏行。**端到端待 API key 或 Ollama 就绪后验证**
+- [x] DeepSeek 后端（`--backend deepseek`，ask 和 extract 通用）：OpenAI 兼容接口、urllib 裸调零新依赖，作为 Claude API 的低成本替代；协议解析已用本地 mock 服务器验证，真实 key 端到端验证待用户
 - [x] recall 接入 ask：ask 自动注入 top3 相关记忆（`<关于用户的记忆>` 块，`--no-memory` 关闭）；生成质量观察同样待 LLM 后端
 - [ ] 时间衰减：暂缓——当前 29 条记忆 created_at 全是同一天，衰减实验零信号；等记忆跨越足够时间再做
 - [ ] 记忆生命周期（其余）：相似记忆合并、冲突解决
@@ -82,6 +83,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python rag_cli.py index <笔记文件夹>         # 增量建索引（.md/.txt/.pdf），写入 .rag_index/
 python rag_cli.py search "<问题>" -k 5       # 混合检索，无需 API key；--rerank 开重排
 python rag_cli.py ask "<问题>"               # 检索+生成，需要 $env:ANTHROPIC_API_KEY
+python rag_cli.py ask "<问题>" --backend deepseek  # DeepSeek API（OpenAI 兼容），需 $env:DEEPSEEK_API_KEY
 python rag_cli.py ask "<问题>" --backend ollama  # 本地模型，完全离线（需安装 Ollama）
 python rag_cli.py eval eval_questions.jsonl  # 跑问答测试集，输出 hit@k / MRR
 python rag_cli.py note add "<标题>" "<内容>"  # 增/改/删笔记后自动增量更新索引
@@ -102,7 +104,7 @@ python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget
 
 单文件 `rag_cli.py`（~190 行）实现完整 RAG 管线：
 
-`read_document`（`.pdf` 用 pypdf 抽文本，其余按 UTF-8 读）→ `chunk_markdown`（`.md` 按标题层级切小节，块前缀「【标题路径】」；其余走 `chunk_text` 固定切块；超长小节滑窗细分）→ `cmd_index`（bge 向量化，存 `.rag_index/chunks.json` + `embeddings.npy` + `files.json` 文件指纹）→ `retrieve`（混合检索：向量余弦 + 手写 BM25 两路，RRF 融合，每路取前 50；`--rerank` 时对前 20 个候选用 cross-encoder `bge-reranker-base` 重排）→ `cmd_ask`（片段注入 prompt，`--backend claude` 流式调 Claude API（默认 `claude-opus-4-8`）或 `--backend ollama` 走本地 http://localhost:11434）。
+`read_document`（`.pdf` 用 pypdf 抽文本，其余按 UTF-8 读）→ `chunk_markdown`（`.md` 按标题层级切小节，块前缀「【标题路径】」；其余走 `chunk_text` 固定切块；超长小节滑窗细分）→ `cmd_index`（bge 向量化，存 `.rag_index/chunks.json` + `embeddings.npy` + `files.json` 文件指纹）→ `retrieve`（混合检索：向量余弦 + 手写 BM25 两路，RRF 融合，每路取前 50；`--rerank` 时对前 20 个候选用 cross-encoder `bge-reranker-base` 重排）→ `cmd_ask`（片段注入 prompt，三个后端：`--backend claude` 流式调 Claude API（默认 `claude-opus-4-8`）、`--backend deepseek` 走 DeepSeek 的 OpenAI 兼容接口（标准库 urllib 裸调 + SSE 流式解析，默认 `deepseek-chat`，密钥读环境变量 `DEEPSEEK_API_KEY`，零新增依赖）、`--backend ollama` 走本地 http://localhost:11434。后端→默认模型的映射在 `default_model_for()`）。
 
 混合检索的约定：BM25 的中文分词是单字+双字滑窗（`tokenize`），BM25 索引在查询时现建（个人笔记量级下足够快）；RRF 只融合排名不融合分数，BM25 零分的块不参与融合。
 
@@ -112,7 +114,7 @@ python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget
 
 记忆召回（`recall_memories`，recall 命令与 memory eval 共用）：混合检索——向量余弦 + BM25（复用 RAG 的 BM25 类和 tokenize）RRF 融合（`MEMORY_RRF_K=20`，独立于 RAG 的 K=60），再加 `IMPORTANCE_COEF=0.0001 × importance` 微调。两个超参都经过 37 题评测网格实验（K∈{20,60,100}×系数∈{0,0.0001,0.0003}）选定。`--rerank` 时取约 3 倍候选池（`pool = max(top_k*3, 15)`）过 `rerank_with_cross_encoder()`（真实现，bge-reranker-base 逐对打分、按分数降序）再裁回 top_k；不开启则直接取 top_k。超参实验已穷尽：K∈{10,20,40,60,100}、系数∈{0,0.0001,0.0003,0.03} 共 9 组，hit@1 始终 59.5%（系数 0.03 会崩到 29.7%——重要性碾压相关性的量化反例）；rerank 一举把 hit@1 提到 75.7%，验证了"零词面交集失败只能靠 cross-encoder"的判断。
 
-记忆提取（`cmd_memory_extract`）：`llm_complete()` 非流式调 LLM（claude/ollama），`EXTRACT_PROMPT` 要求每行一个 JSON（注意拼提示词用 `.replace` 不能 `.format`，JSON 示例的大括号会撞占位符），`parse_extracted_memories()` 宽容解析（跳坏行、type 不合法归 semantic、importance 夹到 1-5），逐条走 `add_memory(source="extracted")` 过查重。`add_memory()` 是 add/extract 共用底层，成功返回 (True, 新记忆)，重复返回 (False, (相似度, 已有记忆))。
+记忆提取（`cmd_memory_extract`）：`llm_complete()` 非流式调 LLM（claude/deepseek/ollama），`EXTRACT_PROMPT` 要求每行一个 JSON（注意拼提示词用 `.replace` 不能 `.format`，JSON 示例的大括号会撞占位符），`parse_extracted_memories()` 宽容解析（跳坏行、type 不合法归 semantic、importance 夹到 1-5），逐条走 `add_memory(source="extracted")` 过查重。`add_memory()` 是 add/extract 共用底层，成功返回 (True, 新记忆)，重复返回 (False, (相似度, 已有记忆))。
 
 ask 记忆注入：`cmd_ask` 自动召回 top3 记忆拼进 `<关于用户的记忆>` 块（system 提示"是背景不是笔记内容"），`--no-memory` 关闭；记忆库为空时静默跳过。记忆内容是文档侧不加 bge 前缀，查询加。**改打分逻辑前后必须跑 `memory eval` 对比，指标不许回退**。
 

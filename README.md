@@ -30,7 +30,11 @@ python rag_cli.py search "怎么创建虚拟环境"
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
 python rag_cli.py ask "这个项目分几个阶段？"
 
-# 3b. 或者走本地 Ollama，完全离线（需要先安装 https://ollama.com 并 pull 模型）
+# 3b. 或者走 DeepSeek API（OpenAI 兼容协议，价格远低于 Claude，效果足够日常使用）
+$env:DEEPSEEK_API_KEY = "sk-..."   # https://platform.deepseek.com 申请
+python rag_cli.py ask "这个项目分几个阶段？" --backend deepseek
+
+# 3c. 或者走本地 Ollama，完全离线（需要先安装 https://ollama.com 并 pull 模型）
 python rag_cli.py ask "这个项目分几个阶段？" --backend ollama
 
 # 4. 检索质量不够时，加 --rerank 用 cross-encoder 重排（更准但更慢，首次下载约 1.1GB 模型）
@@ -47,7 +51,7 @@ python rag_cli.py memory recall "怎么防止重复？" --rerank          # cros
 python rag_cli.py memory list
 python rag_cli.py memory forget m2
 python rag_cli.py memory eval        # 跑记忆召回评测集；--rerank 对比重排效果
-python rag_cli.py memory extract 聊天记录.md --dry-run   # LLM 自动提取记忆（预览）；需 API key 或 Ollama
+python rag_cli.py memory extract 聊天记录.md --dry-run   # LLM 自动提取记忆（预览）；--backend 同 ask
 # ask 会自动注入 top3 相关记忆，让回答贴合你的偏好和背景（--no-memory 关闭）
 # 记忆存在 .memory_store/（个人数据，不进 Git）。评测前先按 eval/memory_eval.json
 # 的预期内容添加 demo 记忆（见仓库提交历史或 CLAUDE.md）
@@ -71,7 +75,7 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 | `cmd_index` | 增量索引：新增/修改的块向量化后存盘，未变文件复用旧向量 |
 | `tokenize` / `BM25` | 中英文轻量分词 + 手写教科书版 BM25 |
 | `retrieve` | 混合检索：向量与 BM25 两路排名，RRF 融合取 top-k；可选 cross-encoder 重排 |
-| `cmd_ask` | 片段注入 prompt，流式调用 Claude（云端）或 Ollama（本地）回答 |
+| `cmd_ask` | 片段注入 prompt，流式调用 Claude / DeepSeek（云端）或 Ollama（本地）回答 |
 | `cmd_eval` | 跑 JSONL 问答测试集，输出 hit@1 / hit@k / MRR 检索指标 |
 | `cmd_note_*` | 笔记增/改/删/列表/打开，改动后调用 `do_index` 自动增量更新索引 |
 | `cmd_memory_*` | 个人记忆增/列/召回/遗忘/评测；召回 = 向量+BM25 混合 RRF + 重要性微调 |
@@ -82,7 +86,7 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 - [x] **结构感知切块**：`.md` 文件按标题层级切小节，块文本带「标题路径」上下文（如 `【Python 学习笔记 > 虚拟环境】`）。注意：改了切块逻辑后文件指纹不变，要手动 `--rebuild`
 - [x] **混合检索**：向量（语义）+ 手写 BM25（关键词，中文用单字+双字分词）两路，RRF 倒数排名融合；`search` 会显示每路的分数
 - [x] **PDF 接入**：`index` 支持 `.pdf`（pypdf 逐页抽取文本）
-- [x] **本地模型**：`ask --backend ollama` 走本地 Ollama（默认 `qwen3:4b`），完全离线；`--backend claude`（默认）走云端
+- [x] **本地模型**：`ask --backend ollama` 走本地 Ollama（默认 `qwen3:4b`），完全离线；`--backend claude`（默认）/ `--backend deepseek` 走云端
 - [x] **rerank**：`--rerank` 用 cross-encoder（`bge-reranker-base`）对召回的前 20 个候选重排
 - [x] **评测工具**：`eval` 命令跑 JSONL 测试集，输出 hit@1 / hit@k / MRR
 - [x] **问答测试集**：50 条问答（`eval_questions.jsonl`，基于 11 篇模拟笔记），混合检索基线 hit@1 94% / MRR 0.970（阶段 1 收尾条件达成；换成真实笔记后照同样格式重建即可）

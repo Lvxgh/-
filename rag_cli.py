@@ -7,6 +7,7 @@ rag_cli.py —— 阶段 0：最朴素的本地笔记 RAG 问答工具
     python rag_cli.py search <问题>           # 混合检索：向量 + BM25，RRF 融合（--rerank 重排）
     python rag_cli.py ask    <问题>           # 检索 + 生成回答
                                               #   --backend claude（默认，需 ANTHROPIC_API_KEY）
+                                              #   --backend deepseek（需 DEEPSEEK_API_KEY，便宜）
                                               #   --backend ollama（本地模型，完全离线）
     python rag_cli.py note   add/append/...   # 笔记增删改，改完自动更新索引
     python rag_cli.py memory add/recall/...   # 个人记忆：记住 / 召回 / 遗忘（阶段 2）
@@ -35,6 +36,10 @@ QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 RERANK_MODEL = "BAAI/bge-reranker-base"  # cross-encoder 重排模型（~1.1GB，仅 --rerank 时加载）
 DEFAULT_MODEL = "claude-opus-4-8"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b"
+# DeepSeek：OpenAI 兼容接口，价格约为 Claude 的几十分之一，质量足够日常问答/记忆提取。
+# "deepseek-chat" 是官方滚动别名，始终指向当前主力模型；想锁定具体版本用 --model 指定
+DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 
 # 模型加载很慢（数秒），缓存到模块级变量——eval 连续跑几十个问题时只加载一次
 _EMBEDDER = None
@@ -360,6 +365,15 @@ def cmd_search(args):
         print(h["text"])
 
 
+def default_model_for(backend: str) -> str:
+    """--model 未指定时按后端选默认模型（ask 和 memory extract 共用）。"""
+    return {
+        "claude": DEFAULT_MODEL,
+        "deepseek": DEFAULT_DEEPSEEK_MODEL,
+        "ollama": DEFAULT_OLLAMA_MODEL,
+    }[backend]
+
+
 def ask_claude(model: str, system: str, user_msg: str):
     import anthropic
 
@@ -409,6 +423,66 @@ def ask_ollama(model: str, system: str, user_msg: str):
         )
 
 
+def deepseek_request(model: str, system: str, user_msg: str, stream: bool):
+    """向 DeepSeek 发起一次聊天请求，返回 HTTP 响应对象。
+
+    DeepSeek 走 OpenAI 兼容协议（和 Ollama 一样是普通 HTTP + JSON），
+    所以同样用标准库 urllib 裸调，不引入任何新依赖。
+    密钥从环境变量 DEEPSEEK_API_KEY 读取（https://platform.deepseek.com 申请）。
+    """
+    import os
+    import urllib.error
+    import urllib.request
+
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        sys.exit(
+            "错误：未设置环境变量 DEEPSEEK_API_KEY。\n"
+            "到 https://platform.deepseek.com 申请密钥后，PowerShell 里执行：\n"
+            "  $env:DEEPSEEK_API_KEY='sk-...'"
+        )
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            "stream": stream,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        DEEPSEEK_API_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    try:
+        return urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        # 带上服务端返回的错误详情（如 401 密钥无效、402 余额不足），方便定位
+        sys.exit(f"错误：DeepSeek API 返回 {e.code}：{e.read().decode('utf-8', errors='ignore')}")
+    except urllib.error.URLError as e:
+        sys.exit(f"错误：连不上 DeepSeek API（{e.reason}），检查网络后重试")
+
+
+def ask_deepseek(model: str, system: str, user_msg: str):
+    """DeepSeek 流式输出。OpenAI 兼容的 SSE 格式：每个事件一行 "data: {...}"。"""
+    with deepseek_request(model, system, user_msg, stream=True) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8").strip()
+            if not line.startswith("data: "):
+                continue  # 跳过空行和 ": keep-alive" 注释行
+            data = line[len("data: "):]
+            if data == "[DONE]":
+                break
+            delta = json.loads(data)["choices"][0].get("delta", {})
+            # deepseek-reasoner 会先流出 reasoning_content（思考过程），这里只打印正式回答
+            print(delta.get("content") or "", end="", flush=True)
+
+
 def cmd_ask(args):
     hits = retrieve(args.question, args.top_k, rerank=args.rerank)
     context = "\n\n".join(
@@ -437,14 +511,11 @@ def cmd_ask(args):
     )
     user_msg = f"<笔记内容>\n{context}\n</笔记内容>{memory_block}\n\n问题：{args.question}"
 
-    # --model 未指定时按后端选默认值
-    model = args.model or (DEFAULT_MODEL if args.backend == "claude" else DEFAULT_OLLAMA_MODEL)
+    model = args.model or default_model_for(args.backend)
     mem_note = f"，注入 {len(mems)} 条记忆" if mems else ""
     print(f"\n[检索到 {len(hits)} 个相关片段{mem_note}，{args.backend}/{model} 生成回答...]\n", file=sys.stderr)
-    if args.backend == "claude":
-        ask_claude(model, system, user_msg)
-    else:
-        ask_ollama(model, system, user_msg)
+    ask_fn = {"claude": ask_claude, "deepseek": ask_deepseek, "ollama": ask_ollama}[args.backend]
+    ask_fn(model, system, user_msg)
     print()
 
 
@@ -626,7 +697,7 @@ EXTRACT_PROMPT = (
 
 
 def llm_complete(backend: str, model: str, system: str, user_msg: str) -> str:
-    """非流式调一次 LLM，拿完整回复（提取等内部用途；ask 的流式输出走 ask_claude/ask_ollama）。"""
+    """非流式调一次 LLM，拿完整回复（提取等内部用途；ask 的流式输出走 ask_claude/ask_deepseek/ask_ollama）。"""
     if backend == "claude":
         import anthropic
 
@@ -636,6 +707,10 @@ def llm_complete(backend: str, model: str, system: str, user_msg: str) -> str:
             messages=[{"role": "user", "content": user_msg}],
         )
         return "".join(b.text for b in resp.content if b.type == "text")
+
+    if backend == "deepseek":
+        with deepseek_request(model, system, user_msg, stream=False) as resp:
+            return json.loads(resp.read())["choices"][0]["message"]["content"]
 
     import urllib.error
     import urllib.request
@@ -697,7 +772,7 @@ def cmd_memory_extract(args):
     else:
         sys.exit("错误：请给出要提取的文件路径，或用 --text 直接给一段文本")
 
-    model = args.model or (DEFAULT_MODEL if args.backend == "claude" else DEFAULT_OLLAMA_MODEL)
+    model = args.model or default_model_for(args.backend)
     print(f"[{args.backend}/{model} 提取记忆中...]", file=sys.stderr)
     # 注意不能用 .format()——提示词里的 JSON 示例带大括号，会被当成占位符
     reply = llm_complete(args.backend, model, EXTRACT_PROMPT.replace("{max_n}", str(args.max_n)), text)
@@ -931,8 +1006,8 @@ def main():
     p_ask.add_argument("-k", "--top-k", type=int, default=5)
     p_ask.add_argument("--rerank", action="store_true", help="用 cross-encoder 对候选重排（更准但更慢）")
     p_ask.add_argument(
-        "--backend", choices=["claude", "ollama"], default="claude",
-        help="claude=云端 API（默认）；ollama=本地模型，完全离线",
+        "--backend", choices=["claude", "deepseek", "ollama"], default="claude",
+        help="claude=Claude API（默认）；deepseek=DeepSeek API（便宜）；ollama=本地模型，完全离线",
     )
     p_ask.add_argument("--model", default=None, help="模型名，不填则按后端用默认值")
     p_ask.add_argument("--no-memory", action="store_true", help="不注入个人记忆，只用笔记回答")
@@ -989,8 +1064,8 @@ def main():
     p_mext = mem_sub.add_parser("extract", help="用 LLM 从文件/文本自动提取记忆（source=extracted）")
     p_mext.add_argument("source_file", nargs="?", default=None, help="要提取的文件（.md/.txt/.pdf）")
     p_mext.add_argument("--text", default=None, help="直接给一段文本（与文件二选一）")
-    p_mext.add_argument("--backend", choices=["claude", "ollama"], default="claude",
-                        help="claude=云端 API（默认）；ollama=本地模型")
+    p_mext.add_argument("--backend", choices=["claude", "deepseek", "ollama"], default="claude",
+                        help="claude=Claude API（默认）；deepseek=DeepSeek API（便宜）；ollama=本地模型")
     p_mext.add_argument("--model", default=None, help="模型名，不填按后端用默认值")
     p_mext.add_argument("--max-n", type=int, default=10, dest="max_n", help="最多提取几条（默认 10）")
     p_mext.add_argument("--dry-run", action="store_true", help="只预览提取结果，不入库")
