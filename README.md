@@ -59,6 +59,9 @@ python rag_cli.py memory merge m1 m4 --content "合并稿"  # 合并两条：保
 python rag_cli.py memory extract 聊天记录.md --review    # 安全模式：LLM 判断每条候选是 add/duplicate/update/conflict/ignore，
                                                          # 只给建议存入待审清单，不直接入库
 python rag_cli.py memory pending list                    # 查看待审候选；apply <id> 执行建议；reject <id> 丢弃
+python rag_cli.py memory consolidate                     # 全库体检：扫相似对，LLM 判断 keep/duplicate/merge/conflict
+                                                         # 默认 dry-run 只打印报告；--threshold 调灵敏度（默认 0.82）；
+                                                         # --save-pending 把建议存入待审清单（库本身仍不动）
 # ask 会自动注入 top3 相关记忆，让回答贴合你的偏好和背景（--no-memory 关闭）
 # 记忆存在 .memory_store/（个人数据，不进 Git）。评测前先按 eval/memory_eval.json
 # 的预期内容添加 demo 记忆（见仓库提交历史或 CLAUDE.md）
@@ -107,4 +110,5 @@ python rag_cli.py note delete "读书笔记-原子习惯"
 - [x] **LLM 查询改写（HyDE）**：`memory recall/eval --rewrite`，LLM 把间接问法改写成"假想记忆"再检索。单开 hit@1 59.5%→**67.6%**（MRR 0.783）；与 rerank 叠加无增益（两者修的是同一批题）——便宜路径（不加载 1.1GB 重排模型）的好选择
 - [x] **记忆去重（阶段 2 第三步）**：`memory add` 自动查重，与已有记忆相似度 ≥0.92 时拒绝并提示，`--force` 可跳过
 - [x] **记忆生命周期最小闭环（阶段 2 第七步）**：`memory update`（部分字段更新+重算向量）、`memory merge`（手动合并两条）；`extract --review` 让 LLM 守门员判断每条候选该 add/duplicate/update/conflict/ignore，存入待审清单（`memory pending list/apply/reject`），LLM 只建议、改库必须人工确认。5 个场景测试（重复/偏好冲突/补充更新/琐事/独立新增）全部判对
+- [x] **全库记忆体检（阶段 2 第八步）**：`memory consolidate` 用现成 embeddings 两两扫相似对（阈值 0.82 可调、同 type 优先、上限 20 对控制成本），LLM 逐对判断 keep/duplicate/merge/conflict。默认 dry-run；`--save-pending` 接入待审清单，merge/duplicate 可一键 apply，conflict 强制人工处理。4 类场景（重复/可合并/冲突/只是相关）全部判对
 - [ ] **向量数据库**：目前是 numpy 暴力点积，规模大了换 sqlite-vec / LanceDB
