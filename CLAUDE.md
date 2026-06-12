@@ -82,8 +82,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 .venv\Scripts\Activate.ps1                  # 依赖：anthropic, sentence-transformers, numpy, pypdf
 python rag_cli.py index <笔记文件夹>         # 增量建索引（.md/.txt/.pdf），写入 .rag_index/
 python rag_cli.py search "<问题>" -k 5       # 混合检索，无需 API key；--rerank 开重排
-python rag_cli.py ask "<问题>"               # 检索+生成，需要 $env:ANTHROPIC_API_KEY
-python rag_cli.py ask "<问题>" --backend deepseek  # DeepSeek API（OpenAI 兼容），需 $env:DEEPSEEK_API_KEY
+python rag_cli.py ask "<问题>"               # 检索+生成，默认走 DeepSeek，需 $env:DEEPSEEK_API_KEY
+python rag_cli.py ask "<问题>" --backend claude  # Claude API，需 $env:ANTHROPIC_API_KEY
 python rag_cli.py ask "<问题>" --backend ollama  # 本地模型，完全离线（需安装 Ollama）
 python rag_cli.py eval eval_questions.jsonl  # 跑问答测试集，输出 hit@k / MRR
 python rag_cli.py note add "<标题>" "<内容>"  # 增/改/删笔记后自动增量更新索引
@@ -99,12 +99,13 @@ python rag_cli.py memory recall "<问题>" -k 5  # 召回；另有 list / forget
 - 台式机上裸 `python` 指向 MSYS2 的 Python（无 pip）；建 venv 要用 `D:\python1\python.exe -m venv .venv`。
 - `.venv/` 和 `.rag_index/` 是机器本地产物，不应进版本控制或跨机同步；换机器后重建即可。
 - PowerShell 默认 GBK 编码，运行前先：`$env:PYTHONIOENCODING='utf-8'; [Console]::OutputEncoding = [Text.Encoding]::UTF8`。
+- API 密钥用 `setx DEEPSEEK_API_KEY "sk-..."` 永久写入 Windows 用户环境变量（新开的终端才生效）；**密钥只放环境变量，绝不写进任何会提交到 Git 的文件**。
 
 ## 架构
 
 单文件 `rag_cli.py`（~190 行）实现完整 RAG 管线：
 
-`read_document`（`.pdf` 用 pypdf 抽文本，其余按 UTF-8 读）→ `chunk_markdown`（`.md` 按标题层级切小节，块前缀「【标题路径】」；其余走 `chunk_text` 固定切块；超长小节滑窗细分）→ `cmd_index`（bge 向量化，存 `.rag_index/chunks.json` + `embeddings.npy` + `files.json` 文件指纹）→ `retrieve`（混合检索：向量余弦 + 手写 BM25 两路，RRF 融合，每路取前 50；`--rerank` 时对前 20 个候选用 cross-encoder `bge-reranker-base` 重排）→ `cmd_ask`（片段注入 prompt，三个后端：`--backend claude` 流式调 Claude API（默认 `claude-opus-4-8`）、`--backend deepseek` 走 DeepSeek 的 OpenAI 兼容接口（标准库 urllib 裸调 + SSE 流式解析，默认 `deepseek-chat`，密钥读环境变量 `DEEPSEEK_API_KEY`，零新增依赖）、`--backend ollama` 走本地 http://localhost:11434。后端→默认模型的映射在 `default_model_for()`）。
+`read_document`（`.pdf` 用 pypdf 抽文本，其余按 UTF-8 读）→ `chunk_markdown`（`.md` 按标题层级切小节，块前缀「【标题路径】」；其余走 `chunk_text` 固定切块；超长小节滑窗细分）→ `cmd_index`（bge 向量化，存 `.rag_index/chunks.json` + `embeddings.npy` + `files.json` 文件指纹）→ `retrieve`（混合检索：向量余弦 + 手写 BM25 两路，RRF 融合，每路取前 50；`--rerank` 时对前 20 个候选用 cross-encoder `bge-reranker-base` 重排）→ `cmd_ask`（片段注入 prompt，三个后端：`--backend deepseek`（默认）走 DeepSeek 的 OpenAI 兼容接口（标准库 urllib 裸调 + SSE 流式解析，默认模型 `deepseek-v4-pro`，密钥读环境变量 `DEEPSEEK_API_KEY`，零新增依赖）、`--backend claude` 流式调 Claude API（默认 `claude-opus-4-8`）、`--backend ollama` 走本地 http://localhost:11434。后端→默认模型的映射在 `default_model_for()`）。
 
 混合检索的约定：BM25 的中文分词是单字+双字滑窗（`tokenize`），BM25 索引在查询时现建（个人笔记量级下足够快）；RRF 只融合排名不融合分数，BM25 零分的块不参与融合。
 

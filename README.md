@@ -26,13 +26,13 @@ python rag_cli.py index sample_notes
 # 2. 纯检索：混合检索（向量+BM25），不需要 API key
 python rag_cli.py search "怎么创建虚拟环境"
 
-# 3a. 检索 + 让 Claude 基于笔记回答（需要先设置 API key）
-$env:ANTHROPIC_API_KEY = "sk-ant-..."
+# 3a. 检索 + 生成回答，默认走 DeepSeek API（OpenAI 兼容协议，价格远低于 Claude）
+$env:DEEPSEEK_API_KEY = "sk-..."   # https://platform.deepseek.com 申请
 python rag_cli.py ask "这个项目分几个阶段？"
 
-# 3b. 或者走 DeepSeek API（OpenAI 兼容协议，价格远低于 Claude，效果足够日常使用）
-$env:DEEPSEEK_API_KEY = "sk-..."   # https://platform.deepseek.com 申请
-python rag_cli.py ask "这个项目分几个阶段？" --backend deepseek
+# 3b. 或者走 Claude API（效果更好但贵）
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+python rag_cli.py ask "这个项目分几个阶段？" --backend claude
 
 # 3c. 或者走本地 Ollama，完全离线（需要先安装 https://ollama.com 并 pull 模型）
 python rag_cli.py ask "这个项目分几个阶段？" --backend ollama
